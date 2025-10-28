@@ -277,25 +277,33 @@ async def websocket_endpoint(websocket: WebSocket, name: str | None = None):
     await websocket.accept()
     logging.info(f"WebSocket connection accepted. Lead name: {name}")
     
-    call_sid = None # Initialize call_sid to None
+    call_sid = None
+    stream_sid = None
+    
     try:
-        # Wait for the first message from Twilio, which is the 'start' event
-        message = await websocket.receive_text()
-        data = json.loads(message)
-        
-        # The first message must be a 'start' event
-        if data['event'] != 'start':
-            logging.error(f"WebSocket connection received non-start event first: {data['event']}")
-            # Close the connection if the protocol is not followed
+        # Twilio sends a 'connected' message before the 'start' message.
+        # We need to loop until we get the 'start' message.
+        while True:
+            message = await websocket.receive_text()
+            data = json.loads(message)
+            event = data.get("event")
+
+            if event == "connected":
+                logging.info("Received 'connected' event from Twilio.")
+                continue
+            
+            if event == "start":
+                call_sid = data['start']['callSid']
+                stream_sid = data['start']['streamSid']
+                logging.info(f"WebSocket received start event for call {call_sid}, stream {stream_sid}")
+                break # Exit the loop once we have the start event
+            
+            # If we receive something else before 'start', it's unexpected.
+            logging.error(f"Received unexpected event '{event}' before 'start'.")
             await websocket.close(code=1002) # Protocol error
             return
 
-        # Extract call and stream SIDs
-        call_sid = data['start']['callSid']
-        stream_sid = data['start']['streamSid']
-        logging.info(f"WebSocket received start event for call {call_sid}, stream {stream_sid}")
-        
-        # Register the connection
+        # Register the connection now that we have the call_sid
         manager.connect(call_sid, websocket)
         
         # Start the agent task to handle the call
@@ -303,10 +311,9 @@ async def websocket_endpoint(websocket: WebSocket, name: str | None = None):
             transcription_agent_task(websocket, call_sid, stream_sid, lead_name=name)
         )
 
-        # Keep the connection alive by listening for messages.
+        # Keep the connection alive by listening for media and other messages.
         # The agent task will handle the media messages.
         while True:
-            # This will block until a message is received or the connection is closed.
             await websocket.receive_text()
 
     except WebSocketDisconnect:
