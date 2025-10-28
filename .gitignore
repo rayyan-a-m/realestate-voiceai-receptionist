@@ -68,3 +68,5 @@ htmlcov/
 *.bak
 *.swp
 .cache/
+# Ignore lead files
+leads.csv
