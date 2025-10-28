@@ -12,7 +12,7 @@ import uvicorn
 import datetime
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.agents import create_tool_calling_agent, AgentExecutor
+from langchain.agents import AgentExecutor, create_react_agent
 from langchain_core.messages import AIMessage, HumanMessage
 
 from deepgram import DeepgramClient, LiveTranscriptionEvents
@@ -33,8 +33,9 @@ elevenlabs_client = ElevenLabs(api_key=config.ELEVENLABS_API_KEY)
 # --- LangChain Agent Setup ---
 tools = [find_available_slots, book_appointment]
 llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
-agent = create_tool_calling_agent(llm, tools, prompt)
-agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+# Using create_react_agent instead of create_tool_calling_agent
+agent = create_react_agent(llm, tools, prompt)
+agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
 
 # --- NEW: Outbound Campaign Management ---
 outbound_leads_queue = asyncio.Queue()
