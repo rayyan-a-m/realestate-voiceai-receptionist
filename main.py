@@ -12,13 +12,13 @@ import uvicorn
 import datetime
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.agents import AgentExecutor, create_react_agent
 from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 
-from deepgram import DeepgramClient, LiveTranscriptionEvents
-from deepgram.options import LiveOptions
+from deepgram import DeepgramClient, DeepgramClientOptions, LiveTranscriptionEvents, LiveOptions
 from elevenlabs.client import ElevenLabs
-from elevenlabs.types import VoiceSettings
+from elevenlabs import VoiceSettings
 
 import config
 from prompts import prompt
@@ -33,9 +33,54 @@ elevenlabs_client = ElevenLabs(api_key=config.ELEVENLABS_API_KEY)
 # --- LangChain Agent Setup ---
 tools = [find_available_slots, book_appointment]
 llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
-# Using create_react_agent instead of create_tool_calling_agent
-agent = create_react_agent(llm, tools, prompt)
-agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
+# Bind tools directly to the LLM for tool calling
+llm_with_tools = llm.bind_tools(tools)
+
+# Create a simple agent executor function
+async def run_agent(user_input: str, chat_history: list):
+    """Run the agent with tool calling capability."""
+    # Format the prompt with history
+    messages = [
+        {"role": "system", "content": prompt.messages[0].prompt.template}
+    ]
+    
+    # Add chat history
+    for msg in chat_history:
+        if isinstance(msg, HumanMessage):
+            messages.append({"role": "user", "content": msg.content})
+        elif isinstance(msg, AIMessage):
+            messages.append({"role": "assistant", "content": msg.content})
+    
+    # Add current user input
+    messages.append({"role": "user", "content": user_input})
+    
+    # Invoke LLM with tools
+    response = await llm_with_tools.ainvoke(messages)
+    
+    # Check if tool calls are needed
+    if hasattr(response, 'tool_calls') and response.tool_calls:
+        tool_results = []
+        for tool_call in response.tool_calls:
+            tool_name = tool_call['name']
+            tool_args = tool_call['args']
+            
+            # Execute the tool
+            if tool_name == 'find_available_slots':
+                result = find_available_slots.invoke(tool_args)
+            elif tool_name == 'book_appointment':
+                result = book_appointment.invoke(tool_args)
+            else:
+                result = f"Unknown tool: {tool_name}"
+            
+            tool_results.append(str(result))
+        
+        # Add tool results to messages and get final response
+        messages.append({"role": "assistant", "content": response.content, "tool_calls": response.tool_calls})
+        messages.append({"role": "tool", "content": "\n".join(tool_results)})
+        final_response = await llm_with_tools.ainvoke(messages)
+        return final_response.content
+    
+    return response.content
 
 # --- NEW: Outbound Campaign Management ---
 outbound_leads_queue = asyncio.Queue()
@@ -106,11 +151,7 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
                 chat_history = conversation_history.get(call_sid, [])
                 
                 # Invoke the agent
-                response = await agent_executor.ainvoke({
-                    "input": transcript,
-                    "chat_history": chat_history,
-                })
-                output_text = response["output"]
+                output_text = await run_agent(transcript, chat_history)
                 print(f"Agent: {output_text}")
                 
                 # Save history
