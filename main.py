@@ -460,13 +460,14 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: dict[str, WebSocket] = {}
 
-    async def connect(self, websocket: WebSocket, call_sid: str):
-        await websocket.accept()
+    async def connect(self, call_sid: str, websocket: WebSocket):
         self.active_connections[call_sid] = websocket
+        logging.info(f"WebSocket registered for call SID: {call_sid}")
 
     def disconnect(self, call_sid: str):
         if call_sid in self.active_connections:
             del self.active_connections[call_sid]
+            logging.info(f"WebSocket disconnected for call SID: {call_sid}")
 
 manager = ConnectionManager()
 conversation_history = {}
