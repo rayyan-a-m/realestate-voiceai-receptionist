@@ -7,7 +7,7 @@ load_dotenv()
 ELEVENLABS_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # Example: "Rachel"
 
 # --- API Keys and Credentials ---
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")

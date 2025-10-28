@@ -18,7 +18,7 @@ The agent uses a combination of best-in-class services orchestrated by a Python 
 - **Telephony**: Twilio for handling phone calls (making, receiving, and managing audio streams).
 - **Speech-to-Text (STT)**: Deepgram for fast and accurate real-time transcription.
 - **Text-to-Speech (TTS)**: ElevenLabs for high-quality, low-latency voice generation.
-- **The "Brain"**: A LangChain agent powered by OpenAI's GPT-4o, equipped with tools to interact with Google Calendar.
+- **The "Brain"**: A LangChain agent powered by Google's Gemini 1.5 Flash, equipped with tools to interact with Google Calendar.
 - **Web Server**: FastAPI for handling webhooks from Twilio and managing WebSocket connections for audio streaming.
 - **Calendar**: Google Calendar API for checking availability and creating events.
 
@@ -44,7 +44,7 @@ The agent uses a combination of best-in-class services orchestrated by a Python 
 - Python 3.9+
 - A Twilio account with a phone number.
 - API keys for:
-  - OpenAI
+  - Google AI (Gemini)
   - Deepgram
   - ElevenLabs
 - A Google Cloud Platform project with the Google Calendar API enabled.
@@ -71,7 +71,7 @@ pip install -r requirements.txt
 Create a `.env` file in the root of the project and fill it with your credentials.
 
 ```
-OPENAI_API_KEY="sk-..."
+GOOGLE_API_KEY="AIza..."  # Get from https://aistudio.google.com/app/apikey
 DEEPGRAM_API_KEY="..."
 ELEVENLABS_API_KEY="..."
 
@@ -87,9 +87,55 @@ AGENT_HOST_URL="https://your-voice-agent.onrender.com"
 YOUR_BUSINESS_NAME="Prestige Properties"
 ```
 
+**Getting Your Google API Key**:
+1. Go to [Google AI Studio](https://aistudio.google.com/app/apikey)
+2. Click "Create API Key"
+3. Copy the key and paste it in your `.env` file
+
 **IMPORTANT**: `AGENT_HOST_URL` must be a publicly accessible URL. You cannot use `localhost`. Services like [Render](https://render.com/) or [Railway](https://railway.app/) are excellent for deploying the application.
 
-### 5. Set Up Google Calendar API
+### 5. Set Up Twilio
+
+Twilio provides the phone number and telephony infrastructure for your voice agent.
+
+#### Step-by-Step Twilio Setup:
+
+1.  **Create a Twilio Account**:
+    - Go to [Twilio](https://www.twilio.com/try-twilio) and sign up for a free account.
+    - You'll receive some free credits to get started.
+
+2.  **Get Your Account SID and Auth Token**:
+    - After logging in, go to your [Twilio Console Dashboard](https://console.twilio.com/).
+    - You'll see your **Account SID** and **Auth Token** displayed prominently.
+    - Copy these values and add them to your `.env` file:
+      ```
+      TWILIO_ACCOUNT_SID="ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      TWILIO_AUTH_TOKEN="your_auth_token_here"
+      ```
+
+3.  **Buy a Phone Number**:
+    - In the Twilio Console, navigate to **Phone Numbers** → **Manage** → **Buy a number**.
+    - Select your country and choose a phone number with **Voice** capabilities.
+    - For the free trial, you can get one phone number for free.
+    - Once purchased, copy the phone number in E.164 format (e.g., `+14155552671`).
+    - Add it to your `.env` file:
+      ```
+      TWILIO_PHONE_NUMBER="+14155552671"
+      ```
+
+4.  **Verify Phone Numbers (Trial Account)**:
+    - If you're using a trial account, Twilio requires you to verify any phone numbers you want to call.
+    - Go to **Phone Numbers** → **Manage** → **Verified Caller IDs**.
+    - Click **Add a new Caller ID** and follow the verification process.
+    - Once verified, you can make outbound calls to that number.
+
+5.  **Upgrade Your Account (Optional)**:
+    - To remove trial limitations (like verified caller IDs), you can upgrade your account.
+    - Go to **Billing** in the Twilio Console and add payment information.
+
+**Note**: After deploying your server, you'll need to configure the webhook URL in Twilio (covered in the Deployment section below).
+
+### 6. Set Up Google Calendar API
 
 1.  Go to the [Google Cloud Console](https://console.cloud.google.com/).
 2.  Create a new project.
@@ -98,7 +144,7 @@ YOUR_BUSINESS_NAME="Prestige Properties"
 5.  Select "Desktop app" as the application type.
 6.  Click "Download JSON" and save the file as `credentials.json` in the project root directory.
 
-### 6. Authenticate with Google
+### 7. Authenticate with Google
 
 Before starting the server, you must run the `google_calendar.py` script once locally to authorize the application and generate a `token.json` file.
 

@@ -11,8 +11,8 @@ from twilio.rest import Client as TwilioClient
 import uvicorn
 import datetime
 
-from langchain_openai import ChatOpenAI
-from langchain.agents import create_openai_tools_agent, AgentExecutor
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.agents import create_tool_calling_agent, AgentExecutor
 from langchain_core.messages import AIMessage, HumanMessage
 
 from deepgram import DeepgramClient, LiveTranscriptionEvents
@@ -32,8 +32,8 @@ elevenlabs_client = ElevenLabs(api_key=config.ELEVENLABS_API_KEY)
 
 # --- LangChain Agent Setup ---
 tools = [find_available_slots, book_appointment]
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
-agent = create_openai_tools_agent(llm, tools, prompt)
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
+agent = create_tool_calling_agent(llm, tools, prompt)
 agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
 
 # --- NEW: Outbound Campaign Management ---
