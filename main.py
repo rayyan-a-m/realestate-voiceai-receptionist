@@ -304,7 +304,7 @@ async def websocket_endpoint(websocket: WebSocket, name: str | None = None):
             return
 
         # Register the connection now that we have the call_sid
-        manager.connect(call_sid, websocket)
+        await manager.connect(call_sid, websocket)
         
         # Start the agent task to handle the call
         agent_task = asyncio.create_task(
