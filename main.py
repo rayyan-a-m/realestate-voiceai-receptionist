@@ -149,9 +149,8 @@ class ConnectionManager:
         self.active_connections: dict[str, WebSocket] = {}
 
     async def connect(self, call_sid: str, websocket: WebSocket):
-        await websocket.accept()
         self.active_connections[call_sid] = websocket
-        logging.info(f"WebSocket connected and registered for call SID: {call_sid}")
+        logging.info(f"WebSocket registered for call SID: {call_sid}")
 
     def disconnect(self, call_sid: str):
         if call_sid in self.active_connections:
