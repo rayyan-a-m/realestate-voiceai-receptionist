@@ -3,6 +3,7 @@ langchain-google-genai>=1.0.0
 fastapi>=0.111.0
 uvicorn>=0.29.0
 python-dotenv>=1.0.1
+python-multipart>=0.0.6
 twilio>=8.11.0
 websockets>=12.0
 deepgram-sdk==3.4.0
