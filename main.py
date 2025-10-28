@@ -274,40 +274,50 @@ async def handle_inbound_call():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, name: str | None = None):
     """The main WebSocket endpoint for Twilio media streams."""
-    logging.info(f"WebSocket connection attempt. Lead name: {name}")
+    await websocket.accept()
+    logging.info(f"WebSocket connection accepted. Lead name: {name}")
+    
+    call_sid = None # Initialize call_sid to None
     try:
+        # Wait for the first message from Twilio, which is the 'start' event
         message = await websocket.receive_text()
         data = json.loads(message)
         
+        # The first message must be a 'start' event
         if data['event'] != 'start':
             logging.error(f"WebSocket connection received non-start event first: {data['event']}")
+            # Close the connection if the protocol is not followed
+            await websocket.close(code=1002) # Protocol error
             return
 
+        # Extract call and stream SIDs
         call_sid = data['start']['callSid']
         stream_sid = data['start']['streamSid']
         logging.info(f"WebSocket received start event for call {call_sid}, stream {stream_sid}")
         
-        await manager.connect(websocket, call_sid)
+        # Register the connection
+        manager.connect(call_sid, websocket)
         
-        # Start the agent task
-        asyncio.create_task(
+        # Start the agent task to handle the call
+        agent_task = asyncio.create_task(
             transcription_agent_task(websocket, call_sid, stream_sid, lead_name=name)
         )
 
-        # Keep the connection alive by waiting for messages
+        # Keep the connection alive by listening for messages.
+        # The agent task will handle the media messages.
         while True:
-            # This loop will break if the client disconnects
+            # This will block until a message is received or the connection is closed.
             await websocket.receive_text()
 
     except WebSocketDisconnect:
-        logging.warning("WebSocket client disconnected.")
+        logging.warning(f"WebSocket client disconnected for call SID: {call_sid if call_sid else 'Unknown'}.")
     except Exception as e:
-        logging.error(f"Error in WebSocket endpoint: {e}", exc_info=True)
+        logging.error(f"Error in WebSocket endpoint for call SID {call_sid if call_sid else 'Unknown'}: {e}", exc_info=True)
     finally:
-        # In case of any error or disconnect, we try to find the call_sid to clean up
-        # This part is tricky as we might not have the call_sid if the start event failed
-        # The cleanup in transcription_agent_task's finally block is more reliable
-        logging.info("WebSocket endpoint closing.")
+        # Ensure cleanup happens if the connection is closed for any reason
+        if call_sid:
+            manager.disconnect(call_sid)
+        logging.info(f"WebSocket endpoint closing for call SID: {call_sid if call_sid else 'Unknown'}.")
 
 @app.post("/start_outbound_campaign")
 async def start_outbound_campaign(file: UploadFile = File(...)):
