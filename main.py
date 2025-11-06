@@ -126,7 +126,8 @@ async def campaign_worker():
             # We instruct Twilio to call the number and then connect to our WebSocket stream.
             # The `url` in `<Stream>` must be a `wss` URL.
             host = urlparse(config.AGENT_HOST_URL).netloc
-            websocket_url = f"wss://{host}/ws?name={lead['first_name']}"
+            logging.info(f"Parsed host for WebSocket URL: {host}")
+            websocket_url = f"wss://realestate-voiceai-receptionist.onrender.com/ws?name={lead['first_name']}"
             
             # We now use TwiML to direct the call
             twiml_response = VoiceResponse()
@@ -275,7 +276,7 @@ async def handle_inbound_call():
     response = VoiceResponse()
     connect = Connect()
     host = urlparse(config.AGENT_HOST_URL).netloc
-    connect.stream(url=f"wss://{host}/ws")
+    connect.stream(url=f"wss://realestate-voiceai-receptionist.onrender.com/ws")
     response.append(connect)
     logging.info(f"Responding to inbound call with TwiML: {str(response)}")
     return Response(content=str(response), media_type="application/xml")
