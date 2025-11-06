@@ -11,6 +11,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 import pytz
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from twilio.twiml.voice_response import VoiceResponse, Connect
 from twilio.rest import Client as TwilioClient
@@ -32,6 +33,17 @@ from google_calendar import find_available_slots, book_appointment
 
 # --- Initialization ---
 app = FastAPI()
+
+# Add CORS middleware to allow all origins
+# This is crucial for services like Twilio to connect via WebSocket
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
 twilio_client = TwilioClient(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
 deepgram_client = DeepgramClient(config.DEEPGRAM_API_KEY)
 elevenlabs_client = AsyncElevenLabs(api_key=config.ELEVENLABS_API_KEY)
