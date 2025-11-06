@@ -23,7 +23,7 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
 from deepgram import DeepgramClient, DeepgramClientOptions, LiveTranscriptionEvents, LiveOptions
-from elevenlabs.client import ElevenLabs
+from elevenlabs.client import AsyncElevenLabs
 from elevenlabs import VoiceSettings
 
 import config
@@ -34,7 +34,7 @@ from google_calendar import find_available_slots, book_appointment
 app = FastAPI()
 twilio_client = TwilioClient(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
 deepgram_client = DeepgramClient(config.DEEPGRAM_API_KEY)
-elevenlabs_client = ElevenLabs(api_key=config.ELEVENLABS_API_KEY)
+elevenlabs_client = AsyncElevenLabs(api_key=config.ELEVENLABS_API_KEY)
 
 logging.info("Service initialized")
 
@@ -224,11 +224,10 @@ async def generate_and_stream_audio(text: str, websocket: WebSocket, stream_sid:
     """Generates audio using ElevenLabs and streams it to Twilio via WebSocket."""
     logging.info(f"Generating audio for stream {stream_sid}: '{text}'")
     try:
-        audio_stream = await elevenlabs_client.generate(
+        audio_stream = await elevenlabs_client.text_to_speech.stream(
             text=text,
-            voice=config.ELEVENLABS_VOICE_ID,
-            model="eleven_turbo_v2",
-            stream=True,
+            voice_id=config.ELEVENLABS_VOICE_ID,
+            model_id="eleven_turbo_v2",
             voice_settings=VoiceSettings(stability=0.5, similarity_boost=0.75),
             output_format="mulaw_8000"
         )
