@@ -237,10 +237,10 @@ async def generate_and_stream_audio(text: str, websocket: WebSocket, stream_sid:
     """Generates audio using ElevenLabs and streams it to Twilio via WebSocket."""
     logging.info(f"Generating audio for stream {stream_sid}: '{text}'")
     try:
-        audio_stream = await elevenlabs_client.text_to_speech.stream(
+        audio_stream = elevenlabs_client.text_to_speech.stream(
             text=text,
-            voice_id=config.ELEVENLABS_VOICE_ID,
-            model_id="eleven_turbo_v2",
+            voice=config.ELEVENLABS_VOICE_ID,
+            model="eleven_turbo_v2",
             voice_settings=VoiceSettings(stability=0.5, similarity_boost=0.75),
             output_format="mulaw_8000"
         )
@@ -283,10 +283,20 @@ async def handle_inbound_call():
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, name: str):
+async def websocket_endpoint(websocket: WebSocket, name: str | None = None):
     """The main WebSocket endpoint for Twilio media streams."""
+    # The headers that FastAPI/Starlette use to check for origins are not
+    # correctly forwarded by some load balancers/proxies, including Render.
+    # We can manually set the `host` to ensure the check passes.
+    # This is a workaround for the "403 Forbidden" error.
+    websocket.scope['headers'] = [
+        (b'host', b'realestate-voiceai-receptionist.onrender.com') 
+        if item[0] == b'host' else item 
+        for item in websocket.scope['headers']
+    ]
+    
     await websocket.accept()
-    logging.info(f"WebSocket connection accepted. Lead name: {name}")
+    logging.info(f"WebSocket connection accepted. Lead name: {name if name else 'Inbound'}")
     
     call_sid = None
     stream_sid = None
