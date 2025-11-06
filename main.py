@@ -178,7 +178,7 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
     logging.info(f"Starting transcription agent for call {call_sid}, stream {stream_sid}")
     deepgram_conn = None
     try:
-        deepgram_conn = deepgram_client.listen.asynclive()
+        deepgram_conn = deepgram_client.listen.asynclive.v("1")
         
         async def on_message(self, result, **kwargs):
             transcript = result.channel.alternatives[0].transcript
