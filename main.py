@@ -178,7 +178,16 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
     logging.info(f"Starting transcription agent for call {call_sid}, stream {stream_sid}")
     deepgram_conn = None
     try:
-        deepgram_conn = deepgram_client.listen.asynclive.v("1")
+        options = LiveOptions(
+            model="nova-2",
+            language="en-US",
+            smart_format=True,
+            encoding="mulaw",
+            channels=1,
+            sample_rate=8000,
+            endpointing=300, # Milliseconds of silence to consider an utterance complete
+        )
+        deepgram_conn = deepgram_client.listen.asynclive(options)
         
         async def on_message(self, result, **kwargs):
             transcript = result.channel.alternatives[0].transcript
@@ -200,17 +209,8 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
                 await generate_and_stream_audio(output_text, websocket, stream_sid)
 
         deepgram_conn.on(LiveTranscriptionEvents.Transcript, on_message)
-
-        options = LiveOptions(
-            model="nova-2",
-            language="en-US",
-            smart_format=True,
-            encoding="mulaw",
-            channels=1,
-            sample_rate=8000,
-            endpointing=300, # Milliseconds of silence to consider an utterance complete
-        )
-        await deepgram_conn.start(options)
+        
+        await deepgram_conn.start()
         
         initial_greeting = f"Hi, am I speaking with {lead_name}?" if lead_name else f"Thank you for calling {config.YOUR_BUSINESS_NAME}, my name is Sky. How can I help you today?"
         logging.info(f"Initial greeting for call {call_sid}: {initial_greeting}")
@@ -240,9 +240,9 @@ async def generate_and_stream_audio(text: str, websocket: WebSocket, stream_sid:
     """Generates audio using ElevenLabs and streams it to Twilio via WebSocket."""
     logging.info(f"Generating audio for stream {stream_sid}: '{text}'")
     try:
-        audio_stream = elevenlabs_client.text_to_speech.stream(
+        audio_stream = await elevenlabs_client.text_to_speech.stream(
             text=text,
-            voice=config.ELEVENLABS_VOICE_ID,
+            voice_id=config.ELEVENLABS_VOICE_ID,
             model="eleven_turbo_v2",
             voice_settings=VoiceSettings(stability=0.5, similarity_boost=0.75),
             output_format="mulaw_8000"
