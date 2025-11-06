@@ -1,10 +1,12 @@
 import asyncio
+import os
 import base64
 import json
 import csv
 import io
 import logging
 from urllib.parse import urlparse
+import websockets
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,11 +21,10 @@ import uvicorn
 import datetime
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
-from deepgram import DeepgramClient, DeepgramClientOptions, LiveTranscriptionEvents, LiveOptions
 from elevenlabs.client import AsyncElevenLabs
 from elevenlabs import VoiceSettings
 
@@ -34,219 +35,220 @@ from google_calendar import find_available_slots, book_appointment
 # --- Initialization ---
 app = FastAPI()
 
-# Add CORS middleware to allow all origins
-# This is crucial for services like Twilio to connect via WebSocket
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 twilio_client = TwilioClient(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
-deepgram_client = DeepgramClient(config.DEEPGRAM_API_KEY)
 elevenlabs_client = AsyncElevenLabs(api_key=config.ELEVENLABS_API_KEY)
 
 logging.info("Service initialized")
 
 # --- LangChain Agent Setup ---
 tools = [find_available_slots, book_appointment]
-llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
-# Bind tools directly to the LLM for tool calling
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, api_key=config.GOOGLE_API_KEY)  # Use a currently available model per ListModels; Flash is faster for voice interactions
 llm_with_tools = llm.bind_tools(tools)
 
-# Create a simple agent executor function
-async def run_agent(user_input: str, chat_history: list):
-    """Run the agent with tool calling capability."""
-    logging.info(f"Running agent with user_input: {user_input}")
-    # Format the prompt with history
-    messages = [
-        {"role": "system", "content": prompt.messages[0].prompt.template}
-    ]
-    
-    # Add chat history
-    for msg in chat_history:
-        if isinstance(msg, HumanMessage):
-            messages.append({"role": "user", "content": msg.content})
-        elif isinstance(msg, AIMessage):
-            messages.append({"role": "assistant", "content": msg.content})
-    
-    # Add current user input
-    messages.append({"role": "user", "content": user_input})
-    
-    # Invoke LLM with tools
-    response = await llm_with_tools.ainvoke(messages)
-    
-    # Check if tool calls are needed
-    if hasattr(response, 'tool_calls') and response.tool_calls:
-        logging.info(f"LLM requested tool calls: {response.tool_calls}")
-        tool_results = []
-        for tool_call in response.tool_calls:
-            tool_name = tool_call['name']
-            tool_args = tool_call['args']
-            
-            # Execute the tool
-            logging.info(f"Executing tool: {tool_name} with args: {tool_args}")
-            if tool_name == 'find_available_slots':
-                result = find_available_slots.invoke(tool_args)
-            elif tool_name == 'book_appointment':
-                result = book_appointment.invoke(tool_args)
+def _to_text(content) -> str:
+    """Normalize LLM content to a plain string for TTS.
+    Handles strings and lists like [{'type': 'text', 'text': '...'}].
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                txt = part.get('text') or ''
+                if txt:
+                    parts.append(txt)
             else:
-                result = f"Unknown tool: {tool_name}"
-            
-            tool_results.append(str(result))
-        
-        # Add tool results to messages and get final response
-        messages.append({"role": "assistant", "content": response.content, "tool_calls": response.tool_calls})
-        messages.append({"role": "tool", "content": "\n".join(tool_results)})
-        final_response = await llm_with_tools.ainvoke(messages)
-        logging.info(f"Agent response after tool call: {final_response.content}")
-        return final_response.content
-    
-    logging.info(f"Agent response: {response.content}")
-    return response.content
+                parts.append(str(part))
+        return " ".join(p.strip() for p in parts if p and p.strip())
+    if isinstance(content, dict):
+        if 'text' in content:
+            return str(content['text'])
+        if 'content' in content:
+            return _to_text(content['content'])
+    # Fallback for LC message objects
+    if hasattr(content, 'content'):
+        return _to_text(getattr(content, 'content'))
+    return str(content)
 
-# --- NEW: Outbound Campaign Management ---
+async def run_agent(user_input: str, chat_history: list):
+    """Run the LLM with optional tool-calling and return plain text for TTS."""
+    logging.info(f"Running agent with user_input: {user_input}")
+
+    # Build LC message list
+    lc_messages = [SystemMessage(content=prompt.messages[0].prompt.template)]
+    lc_messages.extend(chat_history)
+    lc_messages.append(HumanMessage(content=user_input))
+
+    try:
+        logging.info("Invoking LLM...")
+        response = await asyncio.wait_for(llm_with_tools.ainvoke(lc_messages), timeout=20)
+        logging.info(f"LLM response received: {response.content}")
+    except asyncio.TimeoutError:
+        logging.error("LLM timed out after 20s. Returning a brief fallback reply.")
+        return "I'm here. How can I help you today?"
+    except Exception as e:
+        logging.error(f"LLM error: {e}", exc_info=True)
+        return "Sorry, I had trouble responding. Please try again."
+
+    # Handle potential tool calls
+    tool_calls = getattr(response, 'tool_calls', None) or getattr(response, 'additional_kwargs', {}).get('tool_calls')
+    if tool_calls:
+        logging.info(f"LLM requested tool calls: {tool_calls}")
+        tool_results = []
+        for call in tool_calls:
+            try:
+                tool_name = call.get('name') if isinstance(call, dict) else call.name
+                tool_args = call.get('args') if isinstance(call, dict) else call.args
+                logging.info(f"Executing tool: {tool_name} with args: {tool_args}")
+                if tool_name == 'find_available_slots':
+                    result = find_available_slots.invoke(tool_args or {})
+                elif tool_name == 'book_appointment':
+                    result = book_appointment.invoke(tool_args or {})
+                else:
+                    result = f"Unknown tool: {tool_name}"
+            except Exception as e:
+                logging.error(f"Tool '{tool_name}' failed: {e}", exc_info=True)
+                result = f"Tool '{tool_name}' errored."
+            tool_results.append(str(result))
+
+        # Ask model to finalize with tool results
+        lc_messages.append(AIMessage(content=_to_text(response.content)))
+        lc_messages.append(HumanMessage(content=f"Tool results:\n{os.linesep.join(tool_results)}\nPlease respond to the user accordingly."))
+
+        try:
+            final_response = await asyncio.wait_for(llm_with_tools.ainvoke(lc_messages), timeout=20)
+            return _to_text(final_response.content)
+        except asyncio.TimeoutError:
+            logging.error("LLM timed out after tools. Returning brief confirmation.")
+            return "I've checked the calendar and can help you book. What time works for you?"
+        except Exception as e:
+            logging.error(f"LLM error after tools: {e}", exc_info=True)
+            return "I ran into an error finalizing that. Could you rephrase your request?"
+
+    # No tools – return normalized text
+    return _to_text(response.content)
+
+# --- Outbound Campaign Management ---
 outbound_leads_queue = asyncio.Queue()
 campaign_in_progress = False
 
-# This is the worker that processes the queue
 async def campaign_worker():
     global campaign_in_progress
     campaign_in_progress = True
     logging.info("Starting outbound campaign worker...")
-
     while not outbound_leads_queue.empty():
         lead = await outbound_leads_queue.get()
         logging.info(f"Processing lead: {lead['first_name']} {lead['last_name']} at {lead['phone']}")
-        
         try:
-            # For outbound calls, Twilio needs TwiML instructions.
-            # We instruct Twilio to call the number and then connect to our WebSocket stream.
-            # The `url` in `<Stream>` must be a `wss` URL.
-            host = urlparse(config.AGENT_HOST_URL).netloc
-            logging.info(f"Parsed host for WebSocket URL: {host}")
             websocket_url = f"wss://realestate-voiceai-receptionist.onrender.com/ws?name={lead['first_name']}"
-            
-            # We now use TwiML to direct the call
             twiml_response = VoiceResponse()
             connect = Connect()
             connect.stream(url=websocket_url)
             twiml_response.append(connect)
-            
             logging.info(f"Initiating outbound call to {lead['phone']} with TwiML: {str(twiml_response)}")
-
-            call = twilio_client.calls.create(
-                to=lead['phone'],
-                from_=config.TWILIO_PHONE_NUMBER,
-                twiml=str(twiml_response)
-            )
+            call = twilio_client.calls.create(to=lead['phone'], from_=config.TWILIO_PHONE_NUMBER, twiml=str(twiml_response))
             logging.info(f"Outbound call initiated to {lead['phone']}, SID: {call.sid}")
-            
-            # Wait between calls to not be overwhelming
-            await asyncio.sleep(15) 
-
+            await asyncio.sleep(15)
         except Exception as e:
             logging.error(f"Failed to call lead {lead['first_name']}: {e}", exc_info=True)
-        
         outbound_leads_queue.task_done()
-    
     logging.info("Outbound campaign finished.")
     campaign_in_progress = False
 
 # --- Real-time Transcription & Agent Logic ---
-class ConnectionManager:
-    """Manages WebSocket connections for real-time transcription."""
-    def __init__(self):
-        self.active_connections: dict[str, WebSocket] = {}
-
-    async def connect(self, call_sid: str, websocket: WebSocket):
-        self.active_connections[call_sid] = websocket
-        logging.info(f"WebSocket registered for call SID: {call_sid}")
-
-    def disconnect(self, call_sid: str):
-        if call_sid in self.active_connections:
-            del self.active_connections[call_sid]
-            logging.info(f"WebSocket disconnected for call SID: {call_sid}")
-
-manager = ConnectionManager()
 conversation_history = {}
+DEEPGRAM_URL = (
+    f"wss://api.deepgram.com/v1/listen?model=nova-2&language=en-US&smart_format=true"
+    f"&encoding=mulaw&sample_rate=8000&channels=1&endpointing=300"
+)
 
-async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_sid: str, lead_name: str | None = None):
-    """The main task that handles real-time transcription and agent responses."""
-    logging.info(f"Starting transcription agent for call {call_sid}, stream {stream_sid}")
-    deepgram_conn = None
-    try:
-        deepgram_conn = deepgram_client.listen.asynclive.v("1")
+async def transcription_agent_task(twilio_websocket: WebSocket, call_sid: str, stream_sid: str, lead_name: str | None = None):
+    """Handles the full lifecycle of a voice call, including transcription and agent interaction."""
+    logging.info(f"Starting agent task for call {call_sid}, stream {stream_sid}")
+    headers = {"Authorization": f"Token {config.DEEPGRAM_API_KEY}"}
 
-        async def on_message(self, result, **kwargs):
-            transcript = result.channel.alternatives[0].transcript
-            if transcript and result.is_final:
-                logging.info(f"User (call {call_sid}): {transcript}")
+    async with websockets.connect(DEEPGRAM_URL, extra_headers=headers) as deepgram_ws:
+        logging.info(f"Connected to Deepgram for call {call_sid}")
 
-                chat_history = conversation_history.get(call_sid, [])
+        async def twilio_receiver(twilio_ws, deepgram_ws):
+            """Receives audio from Twilio and forwards it to Deepgram."""
+            try:
+                while True:
+                    message_str = await twilio_ws.receive_text()
+                    data = json.loads(message_str)
+                    if data.get("event") == "media":
+                        payload = base64.b64decode(data["media"]["payload"])
+                        await deepgram_ws.send(payload)
+                    elif data.get("event") == "stop":
+                        logging.info(f"Twilio stop event received for call {call_sid}")
+                        break
+            except WebSocketDisconnect:
+                logging.warning(f"Twilio WebSocket disconnected for call {call_sid}")
+            except Exception as e:
+                logging.error(f"Error in twilio_receiver for {call_sid}: {e}")
 
-                # Invoke the agent
-                output_text = await run_agent(transcript, chat_history)
-                logging.info(f"Agent (call {call_sid}): {output_text}")
+        async def deepgram_receiver(deepgram_ws, twilio_ws):
+            """Receives transcripts from Deepgram and triggers the agent."""
+            try:
+                async for msg in deepgram_ws:
+                    resp = json.loads(msg)
+                    if resp.get("type") == "SpeechFinal" or (resp.get("is_final") and resp.get("speech_final")):
+                        transcript = resp["channel"]["alternatives"][0]["transcript"]
+                        if transcript.strip():
+                            logging.info(f"User (call {call_sid}): {transcript}")
 
-                # Save history
-                chat_history.append(HumanMessage(content=transcript))
-                chat_history.append(AIMessage(content=output_text))
-                conversation_history[call_sid] = chat_history
+                            chat_history = conversation_history.get(call_sid, [])
+                            agent_response = await run_agent(transcript, chat_history)
+                            logging.info(f"Agent (call {call_sid}): {agent_response}")
 
-                # Generate audio and stream back to Twilio
-                await generate_and_stream_audio(output_text, websocket, stream_sid)
+                            chat_history.append(HumanMessage(content=transcript))
+                            chat_history.append(AIMessage(content=agent_response))
+                            conversation_history[call_sid] = chat_history
 
-        deepgram_conn.on(LiveTranscriptionEvents.Transcript, on_message)
+                            await generate_and_stream_audio(agent_response, twilio_ws, stream_sid)
+            except Exception as e:
+                logging.error(f"Error in deepgram_receiver for {call_sid}: {e}")
 
-        options = LiveOptions(
-            model="nova-2",
-            language="en-US",
-            smart_format=True,
-            encoding="mulaw",
-            channels=1,
-            sample_rate=8000,
-            endpointing=300,  # Milliseconds of silence to consider an utterance complete
-        )
-        await deepgram_conn.start(options)
+        try:
+            initial_greeting = (
+                f"Hi, am I speaking with {lead_name}?" if lead_name else
+                f"Thank you for calling {config.YOUR_BUSINESS_NAME}, my name is Sky. How can I help you today?"
+            )
+            logging.info(f"Initial greeting for call {call_sid}: {initial_greeting}")
+            await generate_and_stream_audio(initial_greeting, twilio_websocket, stream_sid)
 
-        initial_greeting = f"Hi, am I speaking with {lead_name}?" if lead_name else f"Thank you for calling {config.YOUR_BUSINESS_NAME}, my name is Sky. How can I help you today?"
-        logging.info(f"Initial greeting for call {call_sid}: {initial_greeting}")
-        await generate_and_stream_audio(initial_greeting, websocket, stream_sid)
-
-        while True:
-            message = await websocket.receive_text()
-            data = json.loads(message)
-            if data["event"] == "media":
-                payload = base64.b64decode(data["media"]["payload"])
-                await deepgram_conn.send(payload)
-
-    except WebSocketDisconnect:
-        logging.warning(f"WebSocket disconnected for call {call_sid}")
-    except Exception as e:
-        logging.error(f"Error in transcription_agent_task for {call_sid}: {e}", exc_info=True)
-    finally:
-        if deepgram_conn:
-            await deepgram_conn.finish()
-        manager.disconnect(call_sid)
-        if call_sid in conversation_history:
-            del conversation_history[call_sid]
-        logging.info(f"Connection for call {call_sid} closed.")
-
+            twilio_task = asyncio.create_task(twilio_receiver(twilio_websocket, deepgram_ws))
+            deepgram_task = asyncio.create_task(deepgram_receiver(deepgram_ws, twilio_websocket))
+            await asyncio.gather(twilio_task, deepgram_task)
+        except WebSocketDisconnect:
+            logging.warning(f"WebSocket disconnected during agent task for call {call_sid}")
+        except Exception as e:
+            logging.error(f"Error in transcription_agent_task for {call_sid}: {e}", exc_info=True)
+        finally:
+            if call_sid in conversation_history:
+                del conversation_history[call_sid]
+            logging.info(f"Agent task finished for call {call_sid}.")
 
 async def generate_and_stream_audio(text: str, websocket: WebSocket, stream_sid: str):
-    """Generates audio using ElevenLabs and streams it to Twilio via WebSocket."""
     logging.info(f"Generating audio for stream {stream_sid}: '{text}'")
     try:
         audio_stream = elevenlabs_client.text_to_speech.stream(
             text=text,
             voice_id=config.ELEVENLABS_VOICE_ID,
             voice_settings=VoiceSettings(stability=0.5, similarity_boost=0.75),
-            output_format="mulaw_8000"
+            output_format="ulaw_8000"
         )
-
         async for chunk in audio_stream:
             if chunk:
                 encoded_chunk = base64.b64encode(chunk).decode('utf-8')
@@ -256,8 +258,6 @@ async def generate_and_stream_audio(text: str, websocket: WebSocket, stream_sid:
                     "media": {"payload": encoded_chunk}
                 }
                 await websocket.send_text(json.dumps(media_message))
-
-        # Send a "mark" message to indicate the end of the audio stream
         mark_message = {
             "event": "mark",
             "streamSid": stream_sid,
@@ -268,124 +268,69 @@ async def generate_and_stream_audio(text: str, websocket: WebSocket, stream_sid:
     except Exception as e:
         logging.error(f"Error generating or streaming audio for stream {stream_sid}: {e}", exc_info=True)
 
-
 # --- FastAPI Endpoints ---
-
 @app.post("/inbound_call")
 async def handle_inbound_call():
-    """Handles incoming calls from Twilio."""
     logging.info("Inbound call received")
     response = VoiceResponse()
     connect = Connect()
-    host = urlparse(config.AGENT_HOST_URL).netloc
     connect.stream(url=f"wss://realestate-voiceai-receptionist.onrender.com/ws")
     response.append(connect)
-    logging.info(f"Responding to inbound call with TwiML: {str(response)}")
     return Response(content=str(response), media_type="application/xml")
-
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, name: str | None = None):
-    """The main WebSocket endpoint for Twilio media streams."""
-    # The headers that FastAPI/Starlette use to check for origins are not
-    # correctly forwarded by some load balancers/proxies, including Render.
-    # We can manually set the `host` to ensure the check passes.
-    # This is a workaround for the "403 Forbidden" error.
-    host = urlparse(config.AGENT_HOST_URL).netloc
-    websocket.scope['headers'] = [
-        (b'host', b'realestate-voiceai-receptionist.onrender.com') 
-        if item[0] == b'host' else item 
-        for item in websocket.scope['headers']
-    ]
-    
     await websocket.accept()
     logging.info(f"WebSocket connection accepted. Lead name: {name if name else 'Inbound'}")
-    
-    call_sid = None
-    stream_sid = None
-    
+    call_sid, stream_sid = None, None
     try:
-        # Twilio sends a 'connected' message before the 'start' message.
-        # We need to loop until we get the 'start' message.
         while True:
             message = await websocket.receive_text()
             data = json.loads(message)
             event = data.get("event")
-
             if event == "connected":
-                logging.info("Received 'connected' event from Twilio.")
                 continue
-            
             if event == "start":
                 call_sid = data['start']['callSid']
                 stream_sid = data['start']['streamSid']
                 logging.info(f"WebSocket received start event for call {call_sid}, stream {stream_sid}")
-                break # Exit the loop once we have the start event
-            
-            # If we receive something else before 'start', it's unexpected.
+                break
             logging.error(f"Received unexpected event '{event}' before 'start'.")
-            await websocket.close(code=1002) # Protocol error
             return
-
-        # Register the connection now that we have the call_sid
-        await manager.connect(call_sid, websocket)
         
-        # Start the agent task to handle the call
-        agent_task = asyncio.create_task(
-            transcription_agent_task(websocket, call_sid, stream_sid, lead_name=name)
-        )
-
-        # Keep the connection alive by listening for media and other messages.
-        # The agent task will handle the media messages.
-        while True:
-            await websocket.receive_text()
+        await transcription_agent_task(websocket, call_sid, stream_sid, lead_name=name)
 
     except WebSocketDisconnect:
         logging.warning(f"WebSocket client disconnected for call SID: {call_sid if call_sid else 'Unknown'}.")
     except Exception as e:
         logging.error(f"Error in WebSocket endpoint for call SID {call_sid if call_sid else 'Unknown'}: {e}", exc_info=True)
     finally:
-        # Ensure cleanup happens if the connection is closed for any reason
-        if call_sid:
-            manager.disconnect(call_sid)
         logging.info(f"WebSocket endpoint closing for call SID: {call_sid if call_sid else 'Unknown'}.")
 
 @app.post("/start_outbound_campaign")
 async def start_outbound_campaign(file: UploadFile = File(...)):
-    """
-    Starts an outbound calling campaign from a CSV file.
-    The CSV should have 'first_name', 'last_name', and 'phone' headers.
-    """
     global campaign_in_progress
     if campaign_in_progress:
         return {"status": "error", "message": "A campaign is already in progress."}
-
     logging.info("Received request to start outbound campaign.")
-    
     try:
         content = await file.read()
         file_data = io.StringIO(content.decode("utf-8"))
         reader = csv.DictReader(file_data)
-        
         leads_loaded = 0
         for row in reader:
             await outbound_leads_queue.put(row)
             leads_loaded += 1
-        
         if leads_loaded > 0:
-            # Start the background worker
             asyncio.create_task(campaign_worker())
             message = f"Campaign started with {leads_loaded} leads."
         else:
             message = "No leads found in the uploaded file."
-
         logging.info(message)
         return {"status": "success", "message": message}
-
     except Exception as e:
         logging.error(f"Failed to process uploaded file: {e}", exc_info=True)
         return {"status": "error", "message": "Failed to process file."}
-
 
 if __name__ == "__main__":
     logging.info("Starting server with uvicorn")

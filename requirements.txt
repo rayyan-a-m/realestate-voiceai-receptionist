@@ -6,9 +6,11 @@ python-dotenv>=1.0.1
 python-multipart>=0.0.6
 twilio>=8.11.0
 websockets>=12.0
-deepgram-sdk==3.4.0
 elevenlabs>=1.0.0
+aiohttp==3.9.5
 google-api-python-client>=2.126.0
 google-auth-httplib2>=0.2.0
 google-auth-oauthlib>=1.2.0
 pytz
+sounddevice>=0.4.6
+numpy>=1.26.0
