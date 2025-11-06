@@ -178,6 +178,29 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
     logging.info(f"Starting transcription agent for call {call_sid}, stream {stream_sid}")
     deepgram_conn = None
     try:
+        deepgram_conn = deepgram_client.listen.asynclive.v("1")
+
+        async def on_message(self, result, **kwargs):
+            transcript = result.channel.alternatives[0].transcript
+            if transcript and result.is_final:
+                logging.info(f"User (call {call_sid}): {transcript}")
+
+                chat_history = conversation_history.get(call_sid, [])
+
+                # Invoke the agent
+                output_text = await run_agent(transcript, chat_history)
+                logging.info(f"Agent (call {call_sid}): {output_text}")
+
+                # Save history
+                chat_history.append(HumanMessage(content=transcript))
+                chat_history.append(AIMessage(content=output_text))
+                conversation_history[call_sid] = chat_history
+
+                # Generate audio and stream back to Twilio
+                await generate_and_stream_audio(output_text, websocket, stream_sid)
+
+        deepgram_conn.on(LiveTranscriptionEvents.Transcript, on_message)
+
         options = LiveOptions(
             model="nova-2",
             language="en-US",
@@ -185,33 +208,10 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
             encoding="mulaw",
             channels=1,
             sample_rate=8000,
-            endpointing=300, # Milliseconds of silence to consider an utterance complete
+            endpointing=300,  # Milliseconds of silence to consider an utterance complete
         )
-        deepgram_conn = deepgram_client.listen.asynclive(options)
-        
-        async def on_message(self, result, **kwargs):
-            transcript = result.channel.alternatives[0].transcript
-            if transcript and result.is_final:
-                logging.info(f"User (call {call_sid}): {transcript}")
-                
-                chat_history = conversation_history.get(call_sid, [])
-                
-                # Invoke the agent
-                output_text = await run_agent(transcript, chat_history)
-                logging.info(f"Agent (call {call_sid}): {output_text}")
-                
-                # Save history
-                chat_history.append(HumanMessage(content=transcript))
-                chat_history.append(AIMessage(content=output_text))
-                conversation_history[call_sid] = chat_history
-                
-                # Generate audio and stream back to Twilio
-                await generate_and_stream_audio(output_text, websocket, stream_sid)
+        await deepgram_conn.start(options)
 
-        deepgram_conn.on(LiveTranscriptionEvents.Transcript, on_message)
-        
-        await deepgram_conn.start()
-        
         initial_greeting = f"Hi, am I speaking with {lead_name}?" if lead_name else f"Thank you for calling {config.YOUR_BUSINESS_NAME}, my name is Sky. How can I help you today?"
         logging.info(f"Initial greeting for call {call_sid}: {initial_greeting}")
         await generate_and_stream_audio(initial_greeting, websocket, stream_sid)
@@ -240,10 +240,9 @@ async def generate_and_stream_audio(text: str, websocket: WebSocket, stream_sid:
     """Generates audio using ElevenLabs and streams it to Twilio via WebSocket."""
     logging.info(f"Generating audio for stream {stream_sid}: '{text}'")
     try:
-        audio_stream = await elevenlabs_client.text_to_speech.stream(
+        audio_stream = elevenlabs_client.text_to_speech.stream(
             text=text,
             voice_id=config.ELEVENLABS_VOICE_ID,
-            model="eleven_turbo_v2",
             voice_settings=VoiceSettings(stability=0.5, similarity_boost=0.75),
             output_format="mulaw_8000"
         )
