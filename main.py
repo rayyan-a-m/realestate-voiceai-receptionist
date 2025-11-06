@@ -426,32 +426,43 @@ campaign_in_progress = False
 async def campaign_worker():
     global campaign_in_progress
     campaign_in_progress = True
-    print("Starting outbound campaign worker...")
+    logging.info("Starting outbound campaign worker...")
 
     while not outbound_leads_queue.empty():
         lead = await outbound_leads_queue.get()
-        print(f"Processing lead: {lead['first_name']} {lead['last_name']} at {lead['phone']}")
+        logging.info(f"Processing lead: {lead['first_name']} {lead['last_name']} at {lead['phone']}")
         
         try:
-            # We add lead info to the TwiML URL to pass context to the WebSocket
-            twiml_response = f'<Response><Connect><Stream url="wss://{config.AGENT_HOST_URL.split("//")[1]}/ws?name={lead["first_name"]}" /></Connect></Response>'
+            # For outbound calls, Twilio needs TwiML instructions.
+            # We instruct Twilio to call the number and then connect to our WebSocket stream.
+            # The `url` in `<Stream>` must be a `wss` URL.
+            host = urlparse(config.AGENT_HOST_URL).netloc
+            websocket_url = f"wss://{host}/ws?name={lead['first_name']}"
             
+            # We now use TwiML to direct the call
+            twiml_response = VoiceResponse()
+            connect = Connect()
+            connect.stream(url=websocket_url)
+            twiml_response.append(connect)
+            
+            logging.info(f"Initiating outbound call to {lead['phone']} with TwiML: {str(twiml_response)}")
+
             call = twilio_client.calls.create(
                 to=lead['phone'],
                 from_=config.TWILIO_PHONE_NUMBER,
-                twiml=twiml_response
+                twiml=str(twiml_response)
             )
-            print(f"Outbound call initiated to {lead['phone']}, SID: {call.sid}")
+            logging.info(f"Outbound call initiated to {lead['phone']}, SID: {call.sid}")
             
             # Wait between calls to not be overwhelming
             await asyncio.sleep(15) 
 
         except Exception as e:
-            print(f"Failed to call lead {lead['first_name']}: {e}")
+            logging.error(f"Failed to call lead {lead['first_name']}: {e}", exc_info=True)
         
         outbound_leads_queue.task_done()
     
-    print("Outbound campaign finished.")
+    logging.info("Outbound campaign finished.")
     campaign_in_progress = False
 
 # --- Real-time Transcription & Agent Logic ---
@@ -475,7 +486,7 @@ conversation_history = {}
 async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_sid: str, lead_name: str | None = None):
     """The main task that handles real-time transcription and agent responses."""
     try:
-        deepgram_conn = await deepgram_client.listen.asynclive.v("1")
+        deepgram_conn = deepgram_client.listen.asynclive.v("1")
         
         initial_greeting = f"Hi, am I speaking with {lead_name}?" if lead_name else f"Thank you for calling {config.YOUR_BUSINESS_NAME}, my name is Sky. How can I help you today?"
         await generate_and_stream_audio(initial_greeting, websocket, stream_sid)
@@ -483,13 +494,13 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
         async def on_message(self, result, **kwargs):
             transcript = result.channel.alternatives[0].transcript
             if transcript and result.is_final:
-                print(f"User: {transcript}")
+                logging.info(f"User: {transcript}")
                 
                 chat_history = conversation_history.get(call_sid, [])
                 
                 # Invoke the agent
                 output_text = await run_agent(transcript, chat_history)
-                print(f"Agent: {output_text}")
+                logging.info(f"Agent: {output_text}")
                 
                 # Save history
                 chat_history.append(HumanMessage(content=transcript))
@@ -520,14 +531,14 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
                 await deepgram_conn.send(payload)
 
     except WebSocketDisconnect:
-        print(f"WebSocket disconnected for call {call_sid}")
+        logging.warning(f"WebSocket disconnected for call {call_sid}")
     except Exception as e:
-        print(f"Error in transcription_agent_task for {call_sid}: {e}")
+        logging.error(f"Error in transcription_agent_task for {call_sid}: {e}")
     finally:
         manager.disconnect(call_sid)
         if call_sid in conversation_history:
             del conversation_history[call_sid]
-        print(f"Connection for call {call_sid} closed.")
+        logging.info(f"Connection for call {call_sid} closed.")
 
 
 async def generate_and_stream_audio(text: str, websocket: WebSocket, stream_sid: str):
@@ -569,7 +580,7 @@ async def handle_inbound_call():
     connect = Connect()
     connect.stream(url=f"wss://{config.AGENT_HOST_URL.split('//')[1]}/ws")
     response.append(connect)
-    print("Inbound call received, connecting to WebSocket.")
+    logging.info("Inbound call received, connecting to WebSocket.")
     return Response(content=str(response), media_type="application/xml")
 
 
@@ -589,9 +600,9 @@ async def websocket_endpoint(websocket: WebSocket, name: str | None = None):
         await transcription_agent_task(websocket, call_sid, stream_sid, name)
 
     except WebSocketDisconnect:
-        print("WebSocket disconnected.")
+        logging.warning("WebSocket disconnected.")
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        logging.error(f"WebSocket error: {e}")
 
 
 @app.post("/start_outbound_campaign")
@@ -620,9 +631,10 @@ async def start_outbound_campaign(file: UploadFile = File(...)):
 
 
 if __name__ == "__main__":
-    print(f"Starting server. Make sure your AGENT_HOST_URL is set to a public URL.")
+    logging.info(f"Starting server. Make sure your AGENT_HOST_URL is set to a public URL.")
     if config.AGENT_HOST_URL:
-        print(f"Twilio will connect to: wss://{config.AGENT_HOST_URL.split('//')[1]}/ws")
+        host = urlparse(config.AGENT_HOST_URL).netloc
+        logging.info(f"Twilio will connect to: wss://{host}/ws")
     else:
-        print("AGENT_HOST_URL is not set. Twilio connection will fail.")
+        logging.warning("AGENT_HOST_URL is not set. Twilio connection will fail.")
     uvicorn.run(app, host="0.0.0.0", port=8000)
