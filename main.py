@@ -178,7 +178,7 @@ async def transcription_agent_task(twilio_websocket: WebSocket, call_sid: str, s
     logging.info(f"Starting agent task for call {call_sid}, stream {stream_sid}")
     headers = {"Authorization": f"Token {config.DEEPGRAM_API_KEY}"}
 
-    async with websockets.connect(DEEPGRAM_URL, extra_headers=headers) as deepgram_ws:
+    async with websockets.connect(DEEPGRAM_URL, additional_headers=headers) as deepgram_ws:
         logging.info(f"Connected to Deepgram for call {call_sid}")
 
         async def twilio_receiver(twilio_ws, deepgram_ws):
