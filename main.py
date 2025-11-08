@@ -26,6 +26,7 @@ from vertexai import agent_engines
 
 from google.cloud import speech_v1 as speech
 from google.cloud import texttospeech_v1 as texttospeech
+from google.oauth2 import service_account
 
 import config
 from prompts import prompt
@@ -42,9 +43,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Google Cloud Authentication ---
+# On Render, GOOGLE_APPLICATION_CREDENTIALS is not set directly.
+# Instead, we load the credentials from an environment variable containing the JSON content.
+credentials_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+if credentials_json:
+    credentials_info = json.loads(credentials_json)
+    google_credentials = service_account.Credentials.from_service_account_info(credentials_info)
+    logging.info("Loaded Google Cloud credentials from environment variable.")
+else:
+    # Fallback for local development where GOOGLE_APPLICATION_CREDENTIALS might be set
+    google_credentials = None
+    logging.info("GOOGLE_CREDENTIALS_JSON not found. Using default credential discovery (ADC).")
+
+
 twilio_client = TwilioClient(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
-speech_client = speech.SpeechClient()
-tts_client = texttospeech.TextToSpeechClient()
+speech_client = speech.SpeechClient(credentials=google_credentials)
+tts_client = texttospeech.TextToSpeechClient(credentials=google_credentials)
 
 logging.info("Service initialized")
 
