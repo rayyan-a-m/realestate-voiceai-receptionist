@@ -374,32 +374,56 @@ async def handle_inbound_call():
     return Response(content=str(response), media_type="application/xml")
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, name: str | None = None):
-    await websocket.accept()
-    logging.info(f"WebSocket connection accepted. Lead name: {name if name else 'Inbound'}")
-    call_sid, stream_sid = None, None
+async def websocket_endpoint(websocket: WebSocket, name: str = "Inbound"):
+    """Handles the WebSocket connection from Twilio."""
+    logging.info(f"WebSocket connection accepted. Lead name: {name}")
+    call_sid = "Unknown"
+    stream_sid = "Unknown"
+    
     try:
-        # Wait for the start event from Twilio
-        message = await asyncio.wait_for(websocket.receive_text(), timeout=5)
-        data = json.loads(message)
-        if data.get("event") == "start":
-            call_sid = data['start']['callSid']
-            stream_sid = data['start']['streamSid']
-            logging.info(f"WebSocket received start event for call {call_sid}, stream {stream_sid}")
-            
-            # Start the main agent task
-            await transcription_agent_task(websocket, call_sid, stream_sid, lead_name=name)
-        else:
-            logging.error(f"Received unexpected event '{data.get('event')}' before 'start'.")
+        # First message is 'connected'
+        connected_message = await websocket.receive_text()
+        connected_data = json.loads(connected_message)
+        event = connected_data.get("event")
 
-    except asyncio.TimeoutError:
-        logging.error("WebSocket connection timed out before 'start' event.")
+        if event != "connected":
+            logging.error(f"Expected 'connected' event, but received '{event}'. Closing connection.")
+            await websocket.close()
+            return
+        
+        logging.info(f"Twilio 'connected' event received. Protocol: {connected_data.get('protocol')}, Version: {connected_data.get('version')}")
+
+        # The second message from Twilio should be a 'start' event
+        start_message = await websocket.receive_text()
+        start_data = json.loads(start_message)
+        event = start_data.get("event")
+
+        if event != "start":
+            logging.error(f"Received unexpected event '{event}' before 'start'.")
+            await websocket.close()
+            return
+
+        # Extract call and stream SIDs from the start message
+        call_sid = start_data.get("start", {}).get("callSid", "Unknown")
+        stream_sid = start_data.get("streamSid", "Unknown")
+        logging.info(f"Twilio 'start' event received for call {call_sid}, stream {stream_sid}")
+
+        # Initialize conversation history for this call
+        conversation_history[call_sid] = []
+
+        # Start the main transcription and agent processing task
+        await transcription_agent_task(websocket, call_sid, stream_sid, name)
+
     except WebSocketDisconnect:
-        logging.warning(f"WebSocket client disconnected for call SID: {call_sid or 'Unknown'}.")
+        logging.info(f"WebSocket connection closed for call SID: {call_sid}")
     except Exception as e:
-        logging.error(f"Error in WebSocket endpoint for call SID {call_sid or 'Unknown'}: {e}", exc_info=True)
+        logging.error(f"Error in WebSocket endpoint for call {call_sid}: {e}", exc_info=True)
     finally:
-        logging.info(f"WebSocket endpoint closing for call SID: {call_sid or 'Unknown'}.")
+        logging.info(f"WebSocket endpoint closing for call SID: {call_sid}.")
+        # Clean up conversation history
+        if call_sid in conversation_history:
+            del conversation_history[call_sid]
+            logging.info(f"Cleaned up conversation history for call {call_sid}.")
 
 @app.post("/start_outbound_campaign")
 async def start_outbound_campaign(file: UploadFile = File(...)):
