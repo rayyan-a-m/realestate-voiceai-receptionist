@@ -376,6 +376,7 @@ async def handle_inbound_call():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, name: str = "Inbound"):
     """Handles the WebSocket connection from Twilio."""
+    await websocket.accept()
     logging.info(f"WebSocket connection accepted. Lead name: {name}")
     call_sid = "Unknown"
     stream_sid = "Unknown"
