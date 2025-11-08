@@ -1,5 +1,5 @@
 import asyncio
-from asyncio import Queue
+from queue import Queue # Use standard queue for thread-safe operations
 import os
 import base64
 import json
@@ -265,7 +265,7 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
     """Handles the full lifecycle of a voice call using Google STT/TTS with interruption."""
     logging.info(f"Starting agent task for call {call_sid}, stream {stream_sid}")
     
-    audio_queue = Queue()
+    audio_queue = Queue() # Use a thread-safe queue
     stop_event = asyncio.Event()
     active_agent_task = None
     interruption_event = None
@@ -280,7 +280,7 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
                 event = data.get("event")
                 if event == "media":
                     payload = data["media"]["payload"]
-                    await audio_queue.put(base64.b64decode(payload))
+                    audio_queue.put(base64.b64decode(payload)) # Put data into the thread-safe queue
                 elif event == "stop":
                     logging.info(f"Twilio stop event received for call {call_sid}")
                     stop_event.set()
@@ -291,74 +291,80 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
             logging.error(f"Error in audio_receiver for {call_sid}: {e}")
         finally:
             stop_event.set()
-            await audio_queue.put(None) # Signal end of audio
+            audio_queue.put(None) # Signal end of audio
             logging.info(f"Audio receiver stopped for {call_sid}")
+
+    # This generator function will be run in a separate thread
+    def audio_generator():
+        while not stop_event.is_set():
+            chunk = audio_queue.get()
+            if chunk is None:
+                break
+            yield speech.StreamingRecognizeRequest(audio_content=chunk)
+            audio_queue.task_done()
 
     receiver_task = asyncio.create_task(audio_receiver())
 
     try:
         # 1. Greet the user
-        initial_greeting = (f"Hi, am I speaking with {lead_name}?" if lead_name
-                            else f"Hi, thank you for calling {config.YOUR_BUSINESS_NAME}. My name is Sky, how can I help?")
-        greet_event = asyncio.Event()
-        await generate_and_stream_audio(initial_greeting, websocket, stream_sid, greet_event)
+        greeting_text = f"Hi, am I speaking with {lead_name}?"
+        interruption_event = asyncio.Event()
+        await generate_and_stream_audio(greeting_text, websocket, stream_sid, interruption_event)
 
-        # 2. Main conversation loop
-        while not stop_event.is_set():
-            streaming_config = get_stt_config()
-            
-            async def audio_generator():
-                while not stop_event.is_set():
-                    chunk = await audio_queue.get()
-                    if chunk is None: break
-                    yield speech.StreamingRecognizeRequest(audio_content=chunk)
+        # 2. Start the STT streaming recognition
+        requests = audio_generator()
+        stt_config = get_stt_config()
+        
+        # Run the synchronous STT client in a separate thread
+        responses = await asyncio.to_thread(
+            speech_client.streaming_recognize,
+            config=stt_config,
+            requests=requests
+        )
 
-            try:
-                # This call will block until a final transcript is received
-                responses = await asyncio.to_thread(
-                    speech_client.streaming_recognize,
-                    config=streaming_config,
-                    requests=audio_generator()
-                )
+        # 3. Process STT responses
+        for response in responses: # This loop is now synchronous
+            if not response.results:
+                continue
 
-                transcript = ""
-                for response in responses:
-                    if response.results and response.results[0].alternatives:
-                        transcript = response.results[0].alternatives[0].transcript.strip()
-                        break # We only need the first final result due to single_utterance
+            result = response.results[0]
+            if not result.alternatives:
+                continue
 
-                if transcript:
-                    logging.info(f"User (call {call_sid}): {transcript}")
+            transcript = result.alternatives[0].transcript.strip()
 
-                    # If an agent is currently speaking, interrupt it
-                    if active_agent_task and not active_agent_task.done() and interruption_event:
-                        logging.info(f"User interruption detected for call {call_sid}. Cancelling previous agent response.")
+            if result.is_final:
+                logging.info(f"Final transcript for {call_sid}: '{transcript}'")
+
+                # Create a coroutine to run the async logic
+                async def handle_final_transcript():
+                    nonlocal active_agent_task, interruption_event
+                    if active_agent_task and interruption_event:
+                        logging.info(f"User interrupted. Setting interruption event for {call_sid}.")
                         interruption_event.set()
-                        await asyncio.sleep(0.1) # Give a moment for the task to stop streaming
+                        await active_agent_task
 
-                    # Start processing the new user input
-                    active_agent_task, interruption_event = await handle_agent_response(transcript, call_sid, stream_sid, websocket)
+                    active_agent_task, interruption_event = await handle_agent_response(
+                        transcript, call_sid, stream_sid, websocket
+                    )
+                
+                # Run the async handler in the main event loop
+                asyncio.run_coroutine_threadsafe(handle_final_transcript(), asyncio.get_running_loop())
 
-            except Exception as e:
-                # Handle stream timeouts or other STT errors
-                if "Deadline Exceeded" in str(e):
-                    logging.warning(f"STT stream timed out for {call_sid}. Listening again.")
-                else:
-                    logging.error(f"STT recognizer error for {call_sid}: {e}", exc_info=True)
-                # If there's an error, break the loop to be safe
-                break
+            else:
+                logging.debug(f"Interim transcript for {call_sid}: '{transcript}'")
 
     except Exception as e:
-        logging.error(f"Error in transcription_agent_task for {call_sid}: {e}", exc_info=True)
+        logging.error(f"STT recognizer error for {call_sid}: {e}", exc_info=True)
     finally:
         stop_event.set()
-        receiver_task.cancel()
+        if receiver_task:
+            await receiver_task
         if active_agent_task:
-            active_agent_task.cancel()
-        
-        if call_sid in conversation_history:
-            del conversation_history[call_sid]
-            
+            # Ensure the last agent task is awaited properly
+            await asyncio.sleep(1) # Give it a moment to complete
+            if not active_agent_task.done():
+                 await active_agent_task
         logging.info(f"Agent task finished for call {call_sid}.")
 
 
