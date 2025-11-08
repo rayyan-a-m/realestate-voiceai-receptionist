@@ -25,9 +25,8 @@ from langchain_core.messages import HumanMessage, AIMessage
 from vertexai import agent_engines
 import vertexai  # Needed for explicit project/location initialization
 
-from google.cloud import speech_v1 as speech
-from google.cloud import texttospeech_v1 as texttospeech
-from google.oauth2 import service_account
+from google.cloud import speech
+from google.cloud import texttospeech
 
 import config
 from prompts import prompt
@@ -44,66 +43,43 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Google Cloud Authentication & Vertex AI Init ---
-credentials_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
-credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-google_credentials = None
-credentials_info = None
+# --- Google Cloud & Vertex AI Init ---
+# Centralized credentials from config.py
+google_credentials = config.GOOGLE_CREDENTIALS 
 
-try:
-    if credentials_json:
-        credentials_info = json.loads(credentials_json)
-        google_credentials = service_account.Credentials.from_service_account_info(credentials_info)
-        logging.info("Loaded Google Cloud credentials from GOOGLE_CREDENTIALS_JSON.")
-    elif credentials_path and os.path.exists(credentials_path):
-        google_credentials = service_account.Credentials.from_service_account_file(credentials_path)
-        logging.info(f"Loaded Google Cloud credentials from file path: {credentials_path}")
-    else:
-        logging.warning("No explicit credentials provided (GOOGLE_CREDENTIALS_JSON or GOOGLE_APPLICATION_CREDENTIALS). Falling back to ADC.")
-except Exception as e:
-    logging.error(f"Failed to load Google Cloud credentials: {e}")
-
-# Project/Location for Vertex AI
-project_id = os.getenv("GCP_PROJECT_ID") or (credentials_info.get("project_id") if credentials_info else None) or os.getenv("GOOGLE_CLOUD_PROJECT")
-location = os.getenv("GCP_LOCATION", "us-central1")
-
-if not project_id:
-    logging.error("GCP_PROJECT_ID (or project_id in service account JSON) is required for Vertex AI. Set GCP_PROJECT_ID env var.")
+if not config.GCP_PROJECT_ID:
+    logging.error("GCP_PROJECT_ID is not set. Please check your .env file or environment variables.")
 else:
     try:
-        vertexai.init(project=project_id, location=location, credentials=google_credentials)
-        logging.info(f"Vertex AI initialized for project '{project_id}' in location '{location}'.")
+        vertexai.init(project=config.GCP_PROJECT_ID, location=config.GCP_LOCATION, credentials=google_credentials)
+        logging.info(f"Vertex AI initialized for project '{config.GCP_PROJECT_ID}' in location '{config.GCP_LOCATION}'.")
     except Exception as e:
-        logging.error(f"Failed to initialize Vertex AI (project={project_id}, location={location}): {e}")
+        logging.error(f"Failed to initialize Vertex AI: {e}")
 
-# Model configuration (allow override via env)
-VERTEX_MODEL = os.getenv("VERTEX_MODEL", "gemini-2.5-flash-lite")
-
-
+# --- Service Clients ---
 twilio_client = TwilioClient(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
 speech_client = speech.SpeechClient(credentials=google_credentials)
 tts_client = texttospeech.TextToSpeechClient(credentials=google_credentials)
 
-logging.info("Service initialized")
+logging.info("Service clients initialized.")
 
-# --- LangChain Agent Setup (inspired by local_test.py) ---
+# --- LangChain Agent Setup ---
 try:
-    if not project_id:
-        raise RuntimeError("Missing project_id; cannot create LangchainAgent.")
+    if not config.GCP_PROJECT_ID:
+        raise RuntimeError("Missing GCP_PROJECT_ID; cannot create LangchainAgent.")
+    
     agent = agent_engines.LangchainAgent(
-        model=VERTEX_MODEL,
+        model=config.VERTEX_MODEL,
         tools=[find_available_slots, book_appointment],
-        model_kwargs={
-            "temperature": 0.0,
-            "max_output_tokens": 512,
-            "top_p": 0.95,
-        },
-        # system_instruction=prompt.messages[0].prompt.template
+        model_kwargs={"temperature": 0.0},
+        system_instruction=prompt.messages[0].prompt.template
     )
-    logging.info(f"Vertex AI LangchainAgent initialized successfully with model '{VERTEX_MODEL}'.")
+    logging.info(f"Vertex AI LangchainAgent initialized successfully with model '{config.VERTEX_MODEL}'.")
 except Exception as e:
     logging.error(f"Failed to initialize LLM Agent: {e}", exc_info=True)
-    raise SystemExit(1)
+    # Depending on the severity, you might want to exit
+    # raise SystemExit(1) from e
+
 
 
 def _to_text(content) -> str:
