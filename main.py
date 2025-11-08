@@ -77,7 +77,7 @@ else:
         logging.error(f"Failed to initialize Vertex AI (project={project_id}, location={location}): {e}")
 
 # Model configuration (allow override via env)
-VERTEX_MODEL = os.getenv("VERTEX_MODEL", "gemini-1.5-flash-001")
+VERTEX_MODEL = os.getenv("VERTEX_MODEL", "gemini-2.5-flash-lite")
 
 
 twilio_client = TwilioClient(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
