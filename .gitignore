@@ -36,6 +36,9 @@ MANIFEST
 *.wav
 *.flac
 
+
+credentials.json
+
 # Virtual Environment
 venv/
 ENV/
