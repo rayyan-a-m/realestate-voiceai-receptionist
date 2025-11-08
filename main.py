@@ -23,6 +23,7 @@ import datetime
 
 from langchain_core.messages import HumanMessage, AIMessage
 from vertexai import agent_engines
+import vertexai  # Needed for explicit project/location initialization
 
 from google.cloud import speech_v1 as speech
 from google.cloud import texttospeech_v1 as texttospeech
@@ -43,18 +44,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Google Cloud Authentication ---
-# On Render, GOOGLE_APPLICATION_CREDENTIALS is not set directly.
-# Instead, we load the credentials from an environment variable containing the JSON content.
+# --- Google Cloud Authentication & Vertex AI Init ---
 credentials_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
-if credentials_json:
-    credentials_info = json.loads(credentials_json)
-    google_credentials = service_account.Credentials.from_service_account_info(credentials_info)
-    logging.info("Loaded Google Cloud credentials from environment variable.")
+credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+google_credentials = None
+credentials_info = None
+
+try:
+    if credentials_json:
+        credentials_info = json.loads(credentials_json)
+        google_credentials = service_account.Credentials.from_service_account_info(credentials_info)
+        logging.info("Loaded Google Cloud credentials from GOOGLE_CREDENTIALS_JSON.")
+    elif credentials_path and os.path.exists(credentials_path):
+        google_credentials = service_account.Credentials.from_service_account_file(credentials_path)
+        logging.info(f"Loaded Google Cloud credentials from file path: {credentials_path}")
+    else:
+        logging.warning("No explicit credentials provided (GOOGLE_CREDENTIALS_JSON or GOOGLE_APPLICATION_CREDENTIALS). Falling back to ADC.")
+except Exception as e:
+    logging.error(f"Failed to load Google Cloud credentials: {e}")
+
+# Project/Location for Vertex AI
+project_id = os.getenv("GCP_PROJECT_ID") or (credentials_info.get("project_id") if credentials_info else None) or os.getenv("GOOGLE_CLOUD_PROJECT")
+location = os.getenv("GCP_LOCATION", "us-central1")
+
+if not project_id:
+    logging.error("GCP_PROJECT_ID (or project_id in service account JSON) is required for Vertex AI. Set GCP_PROJECT_ID env var.")
 else:
-    # Fallback for local development where GOOGLE_APPLICATION_CREDENTIALS might be set
-    google_credentials = None
-    logging.info("GOOGLE_CREDENTIALS_JSON not found. Using default credential discovery (ADC).")
+    try:
+        vertexai.init(project=project_id, location=location, credentials=google_credentials)
+        logging.info(f"Vertex AI initialized for project '{project_id}' in location '{location}'.")
+    except Exception as e:
+        logging.error(f"Failed to initialize Vertex AI (project={project_id}, location={location}): {e}")
+
+# Model configuration (allow override via env)
+VERTEX_MODEL = os.getenv("VERTEX_MODEL", "gemini-1.5-flash-001")
 
 
 twilio_client = TwilioClient(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
@@ -65,22 +88,22 @@ logging.info("Service initialized")
 
 # --- LangChain Agent Setup (inspired by local_test.py) ---
 try:
+    if not project_id:
+        raise RuntimeError("Missing project_id; cannot create LangchainAgent.")
     agent = agent_engines.LangchainAgent(
-        model="gemini-1.5-flash-lite", # Using a recommended model
+        model=VERTEX_MODEL,
         tools=[find_available_slots, book_appointment],
         model_kwargs={
             "temperature": 0.0,
-            "max_output_tokens": 512, # Increased for potentially complex tool responses
+            "max_output_tokens": 512,
             "top_p": 0.95,
         },
-        # System instructions can be passed here if needed
         # system_instruction=prompt.messages[0].prompt.template
     )
-    logging.info("Vertex AI LangchainAgent initialized successfully.")
+    logging.info(f"Vertex AI LangchainAgent initialized successfully with model '{VERTEX_MODEL}'.")
 except Exception as e:
     logging.error(f"Failed to initialize LLM Agent: {e}", exc_info=True)
-    # Exit if the agent fails to initialize, as it's critical
-    exit(1)
+    raise SystemExit(1)
 
 
 def _to_text(content) -> str:
