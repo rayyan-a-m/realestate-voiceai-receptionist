@@ -270,14 +270,29 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
             audio_queue.put(None) # Signal end of audio
             logging.info(f"Audio receiver stopped for {call_sid}")
 
-    # This generator function will be run in a separate thread
-    def audio_generator():
-        while not stop_event.is_set():
-            chunk = audio_queue.get()
-            if chunk is None:
-                break
-            yield speech.StreamingRecognizeRequest(audio_content=chunk)
-            audio_queue.task_done()
+    # Helper class to bridge async generator with sync gRPC client
+    class AsyncAudioStream:
+        def __init__(self, audio_queue: Queue, stop_event: asyncio.Event):
+            self._queue = audio_queue
+            self._stop_event = stop_event
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self._stop_event.is_set():
+                raise StopIteration
+
+            try:
+                # This runs in a thread, so we need to run the async `get`
+                # in the main event loop and wait for the result.
+                future = asyncio.run_coroutine_threadsafe(self._queue.get(), asyncio.get_running_loop())
+                chunk = future.result() # Blocks until an item is available
+                if chunk is None:
+                    raise StopIteration
+                return speech.StreamingRecognizeRequest(audio_content=chunk)
+            except Exception:
+                raise StopIteration
 
     receiver_task = asyncio.create_task(audio_receiver())
 
@@ -288,7 +303,7 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
         await generate_and_stream_audio(greeting_text, websocket, stream_sid, interruption_event)
 
         # 2. Start the STT streaming recognition
-        requests = audio_generator()
+        requests = AsyncAudioStream(audio_queue, stop_event)
         stt_config = get_stt_config()
         
         # Run the synchronous STT client in a separate thread
