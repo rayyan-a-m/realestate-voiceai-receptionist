@@ -2,7 +2,7 @@
 ## which relies on `from langchain.load import ...` (removed in langchain>=0.2)
 langchain==0.1.20
 langchain-core==0.1.52
-langchain-google-vertexai==1.0.0
+langchain-google-vertexai==1.0.1
 fastapi>=0.111.0
 uvicorn>=0.29.0
 python-dotenv>=1.0.1
