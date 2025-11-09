@@ -39,6 +39,30 @@ from langchain_core.messages import HumanMessage, AIMessage
 from vertexai import agent_engines
 import vertexai  # Needed for explicit project/location initialization
 
+
+# --- Agent Wrapper for Error Handling ---
+class SafeLangchainAgent(agent_engines.LangchainAgent):
+    """
+    A wrapper around LangchainAgent to gracefully handle internal errors.
+
+    The base LangchainAgent can raise an AttributeError if the underlying model
+    returns an error payload (often a list) instead of a valid JSON response.
+    This wrapper catches that specific error during the query and returns a
+    structured error message, preventing the main application from crashing.
+    """
+    def query(self, *args, **kwargs):
+        try:
+            return super().query(*args, **kwargs)
+        except AttributeError as e:
+            # This error is typically raised when the agent's internal parser
+            # receives an error list from the model instead of a dict.
+            logging.error(f"Caught AttributeError inside LangchainAgent query: {e}")
+            # Return a consistent error format that the rest of the app can handle.
+            return {
+                "output": "I'm sorry, I encountered a processing error. Could you please try again?"
+            }
+
+
 from google.cloud import speech
 from google.cloud import texttospeech
 
@@ -82,10 +106,14 @@ try:
     if not config.GCP_PROJECT_ID:
         raise RuntimeError("Missing GCP_PROJECT_ID; cannot create LangchainAgent.")
     
-    agent = agent_engines.LangchainAgent(
+    agent = SafeLangchainAgent(
         model=config.VERTEX_MODEL,
         tools=[find_available_slots, book_appointment],
-        model_kwargs={"temperature": 0.0},
+        model_kwargs={
+                "temperature": 0.0,
+                "max_output_tokens": 256,
+                "top_p": 0.95,
+            },
         system_instruction=prompt.messages[0].prompt.template
     )
     logging.info(f"Vertex AI LangchainAgent initialized successfully with model '{config.VERTEX_MODEL}'.")
@@ -107,8 +135,19 @@ def _to_text(content) -> str:
     Never raises on unexpected shapes; always returns a best-effort string.
     """
     try:
+        logging.info(f"Normalizing content to text: {content} (type: {type(content)})")
         if content is None:
             return ""
+
+        # Handle lists first, as they are a common error format from Vertex
+        if isinstance(content, list):
+            parts = [
+                _to_text(part)
+                for part in content
+                if part is not None and _to_text(part) is not None
+            ]
+            # Filter out empties while preserving spacing
+            return " ".join(p for p in parts if p)
 
         # Common simple cases
         if isinstance(content, str):
@@ -141,16 +180,6 @@ def _to_text(content) -> str:
                 return _to_text(candidates)
             # Fallback to stringifying the dict
             return str(content)
-
-        # Lists: flatten recursively
-        if isinstance(content, list):
-            parts = [
-                _to_text(part)
-                for part in content
-                if part is not None and _to_text(part) is not None
-            ]
-            # Filter out empties while preserving spacing
-            return " ".join(p for p in parts if p)
 
         # Anything else: best-effort string
         return str(content)
@@ -271,7 +300,7 @@ async def handle_agent_response(transcript: str, call_sid: str, stream_sid: str,
         try:
             # Use the global agent instance
             logging.info(f"starting Querying agent for call {call_sid}")
-            agent_response = await asyncio.to_thread(agent.query, input=transcript)
+            agent_response = await asyncio.to_thread(agent.query, transcript)
             logging.info(f"Agent response for call {call_sid}: {agent_response}")
 
             # The agent may return a list on error. If so, handle it as a failure.

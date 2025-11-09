@@ -46,7 +46,7 @@ GOOGLE_CREDENTIALS = get_google_credentials()
 project_id_from_creds = GOOGLE_CREDENTIALS.project_id if GOOGLE_CREDENTIALS else None
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID") or project_id_from_creds or os.getenv("GOOGLE_CLOUD_PROJECT")
 GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
-VERTEX_MODEL = os.getenv("VERTEX_MODEL", "gemini-1.5-flash-001")
+VERTEX_MODEL = os.getenv("VERTEX_MODEL", "gemini-2.5-flash-lite")
 
 # --- Twilio Configuration ---
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
