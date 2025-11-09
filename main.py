@@ -41,26 +41,26 @@ import vertexai  # Needed for explicit project/location initialization
 
 
 # --- Agent Wrapper for Error Handling ---
-class SafeLangchainAgent(agent_engines.LangchainAgent):
-    """
-    A wrapper around LangchainAgent to gracefully handle internal errors.
+# class SafeLangchainAgent(agent_engines.LangchainAgent):
+#     """
+#     A wrapper around LangchainAgent to gracefully handle internal errors.
 
-    The base LangchainAgent can raise an AttributeError if the underlying model
-    returns an error payload (often a list) instead of a valid JSON response.
-    This wrapper catches that specific error during the query and returns a
-    structured error message, preventing the main application from crashing.
-    """
-    def query(self, *args, **kwargs):
-        try:
-            return super().query(*args, **kwargs)
-        except AttributeError as e:
-            # This error is typically raised when the agent's internal parser
-            # receives an error list from the model instead of a dict.
-            logging.error(f"Caught AttributeError inside LangchainAgent query: {e}")
-            # Return a consistent error format that the rest of the app can handle.
-            return {
-                "output": "I'm sorry, I encountered a processing error. Could you please try again?"
-            }
+#     The base LangchainAgent can raise an AttributeError if the underlying model
+#     returns an error payload (often a list) instead of a valid JSON response.
+#     This wrapper catches that specific error during the query and returns a
+#     structured error message, preventing the main application from crashing.
+#     """
+#     def query(self, *args, **kwargs):
+#         try:
+#             return super().query(*args, **kwargs)
+#         except AttributeError as e:
+#             # This error is typically raised when the agent's internal parser
+#             # receives an error list from the model instead of a dict.
+#             logging.error(f"Caught AttributeError inside LangchainAgent query: {e}")
+#             # Return a consistent error format that the rest of the app can handle.
+#             return {
+#                 "output": "I'm sorry, I encountered a processing error. Could you please try again?"
+#             }
 
 
 from google.cloud import speech
@@ -106,7 +106,7 @@ try:
     if not config.GCP_PROJECT_ID:
         raise RuntimeError("Missing GCP_PROJECT_ID; cannot create LangchainAgent.")
     
-    agent = SafeLangchainAgent(
+    agent = agent_engines.LangchainAgent(
         model=config.VERTEX_MODEL,
         tools=[find_available_slots, book_appointment],
         model_kwargs={
@@ -300,7 +300,7 @@ async def handle_agent_response(transcript: str, call_sid: str, stream_sid: str,
         try:
             # Use the global agent instance
             logging.info(f"starting Querying agent for call {call_sid}")
-            agent_response = await asyncio.to_thread(agent.query, transcript)
+            agent_response = await asyncio.to_thread(agent.query, input=transcript)
             logging.info(f"Agent response for call {call_sid}: {agent_response}")
 
             # The agent may return a list on error. If so, handle it as a failure.
