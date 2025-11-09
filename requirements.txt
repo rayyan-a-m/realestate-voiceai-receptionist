@@ -18,4 +18,3 @@ sounddevice>=0.4.6
 numpy>=1.26.0
 webrtcvad>=2.0.10
 langchain-community>=0.0.36
-

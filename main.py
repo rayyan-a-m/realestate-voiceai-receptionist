@@ -241,6 +241,7 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
     """Handles the full lifecycle of a voice call using Google STT/TTS with interruption."""
     logging.info(f"Starting agent task for call {call_sid}, stream {stream_sid}")
     
+    main_loop = asyncio.get_running_loop()
     audio_queue = Queue()
     stop_event = asyncio.Event()
     active_agent_task = None
@@ -275,7 +276,7 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
             logging.info(f"Audio receiver stopped for {call_sid}")
 
     # --- STT Worker (Sync, runs in a separate thread) ---
-    def stt_worker():
+    def stt_worker(loop):
         """Processes audio from the queue using Google STT in a blocking manner."""
         
         def audio_generator():
@@ -309,7 +310,7 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
                     # in the main event loop.
                     asyncio.run_coroutine_threadsafe(
                         handle_final_transcript(transcript),
-                        asyncio.get_running_loop()
+                        loop
                     )
                     # Because single_utterance=True, the stream will close here.
                     # We break to allow the worker to exit and be restarted for the next turn.
@@ -355,7 +356,7 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
         # 2. Start the STT worker loop
         while not stop_event.is_set():
             # Run the synchronous STT worker in a background thread
-            await asyncio.to_thread(stt_worker)
+            await asyncio.to_thread(stt_worker, main_loop)
             # After stt_worker finishes (due to single_utterance), it will loop
             # and start a new recognition stream, unless the stop_event is set.
             if stop_event.is_set():
