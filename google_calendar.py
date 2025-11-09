@@ -105,10 +105,13 @@ def find_available_slots() -> str:
 
 @tool
 def book_appointment(datetime_str: str, full_name: str, email: str, property_name: str) -> str:
-    """
-    Books a 30-minute property visit.
-    The datetime_str should be in 'YYYY-MM-DD HH:MM' format (24-hour clock).
-    Requires the customer's full name, email, and the name of the property they will visit.
+    """Books a 30-minute property visit appointment.
+
+    Args:
+        datetime_str: The appointment time in 'YYYY-MM-DD HH:MM' format (24-hour clock).
+        full_name: The full name of the person booking the visit.
+        email: The email address of the person.
+        property_name: The name of the property they want to visit.
     """
     logging.info(f"Tool 'book_appointment' invoked with: datetime='{datetime_str}', name='{full_name}', email='{email}', property='{property_name}'")
     try:

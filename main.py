@@ -208,14 +208,10 @@ async def handle_agent_response(transcript: str, call_sid: str, stream_sid: str,
             # Use the global agent instance
             agent_response = await asyncio.to_thread(agent.query, input=transcript)
 
-            # Handle cases where the agent returns a list, often on error
+            # The agent may return a list on error. If so, handle it as a failure.
             if isinstance(agent_response, list):
-                if agent_response:
-                    # Attempt to extract the meaningful part of the response
-                    agent_response = agent_response[0] 
-                else:
-                    # If the list is empty, treat it as an empty response
-                    agent_response = ""
+                logging.error(f"Agent returned a list, treating as error. Payload: {agent_response}")
+                raise AttributeError(f"Agent returned a list: {agent_response}")
 
             tts_text = _to_text(agent_response)
         except AttributeError as e:
