@@ -207,6 +207,16 @@ async def handle_agent_response(transcript: str, call_sid: str, stream_sid: str,
         try:
             # Use the global agent instance
             agent_response = await asyncio.to_thread(agent.query, input=transcript)
+
+            # Handle cases where the agent returns a list, often on error
+            if isinstance(agent_response, list):
+                if agent_response:
+                    # Attempt to extract the meaningful part of the response
+                    agent_response = agent_response[0] 
+                else:
+                    # If the list is empty, treat it as an empty response
+                    agent_response = ""
+
             tts_text = _to_text(agent_response)
         except AttributeError as e:
             # Common when underlying Google client returns a list payload on error
