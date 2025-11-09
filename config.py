@@ -12,6 +12,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # --- Google Cloud Credentials ---
 # This is the central source of truth for all Google Cloud authentication.
+# In production (like Render), set GOOGLE_CREDENTIALS_JSON as a secret
+# environment variable with the content of your service account JSON file.
+# For local development, you can set GOOGLE_APPLICATION_CREDENTIALS to the *path* of the JSON file.
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 GOOGLE_APPLICATION_CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
@@ -28,7 +31,7 @@ def get_google_credentials():
             logging.info(f"Loaded Google Cloud credentials from file: {GOOGLE_APPLICATION_CREDENTIALS_PATH}")
         else:
             # This is not an error, but a fallback to Application Default Credentials (ADC)
-            logging.warning("No explicit Google Cloud credentials provided (JSON or path). Falling back to ADC.")
+            logging.warning("No explicit Google Cloud credentials provided (JSON or path). Falling back to ADC. This may not work in all environments.")
     except json.JSONDecodeError as e:
         logging.error(f"Failed to parse GOOGLE_CREDENTIALS_JSON: {e}")
     except Exception as e:
@@ -50,17 +53,31 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 
-# --- Calendar Configuration ---
+# --- Business & Calendar Configuration ---
+YOUR_BUSINESS_NAME = "Prestige Properties"
 APPOINTMENT_DURATION_MINUTES = 30
-TIMEZONE = "America/Los_Angeles"
+TIMEZONE = "America/New_York" # e.g., "America/New_York", "Europe/London"
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 TOKEN_JSON_PATH = "token.json" # For user OAuth flow
 
 # --- Property Information (Static) ---
-PROPERTY_INFO = {
-    "address": "123 Main Street, Anytown, USA",
-    "bedrooms": 3,
-    "bathrooms": 2,
-    "price": 500000,
-    "features": "a large backyard, a newly renovated kitchen, and a two-car garage.",
-}
+# This information will be used by the agent to answer questions.
+PROPERTIES = [
+    {
+        "id": "prop123",
+        "address": "123 Main St, Anytown, USA",
+        "bedrooms": 3,
+        "bathrooms": 2,
+        "price": 500000,
+        "features": "A beautiful family home with a large backyard and modern kitchen.",
+    },
+    {
+        "id": "prop456",
+        "address": "456 Oak Ave, Anytown, USA",
+        "bedrooms": 4,
+        "bathrooms": 3,
+        "price": 750000,
+        "features": "A spacious luxury home with a pool and a three-car garage.",
+    },
+]
+
