@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import warnings
 from dotenv import load_dotenv
 import os
 from vertexai import agent_engines
@@ -7,6 +8,13 @@ import config
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Quiet known deprecation noise from Vertex AI SDK during test runs
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    module=r"vertexai\.generative_models\._generative_models",
+)
 
 async def test_llm_connection():
     logging.info("Initializing Vertex AI LangChain Agent...")

@@ -6,11 +6,24 @@ import json
 import csv
 import io
 import logging
+import warnings
 from urllib.parse import urlparse
 import websockets
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Tame noisy third-party warnings in runtime logs
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    module=r"vertexai\.generative_models\._generative_models",
+)
+warnings.filterwarnings(
+    "ignore",
+    category=SyntaxWarning,
+    module=r"langchain\.agents\.json_chat\.base",
+)
 
 import pytz
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
@@ -84,18 +97,69 @@ except Exception as e:
 
 
 def _to_text(content) -> str:
-    """Normalize agent/LLM content to plain string for TTS."""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, dict):
-        return content.get("output", "")
-    if hasattr(content, "content"):
-        return _to_text(content.content)
-    if isinstance(content, list):
-        return " ".join(_to_text(part) for part in content if part)
-    return str(content)
+    """Normalize agent/LLM content to plain string for TTS.
+
+    Tries common shapes returned by Vertex AI + LangChain across versions:
+    - Plain string
+    - Objects with .text / .output_text / .content
+    - Dicts with keys like ["output", "text", "content", "result", "message"]
+    - Lists of the above (flattens recursively)
+    Never raises on unexpected shapes; always returns a best-effort string.
+    """
+    try:
+        if content is None:
+            return ""
+
+        # Common simple cases
+        if isinstance(content, str):
+            return content
+
+        # Vertex / LangChain objects often expose .text or .output_text
+        for attr in ("text", "output_text"):
+            if hasattr(content, attr):
+                try:
+                    val = getattr(content, attr)
+                    return val if isinstance(val, str) else _to_text(val)
+                except Exception:
+                    pass
+
+        # Some responses expose a .content attribute which may itself be a list or nested object
+        if hasattr(content, "content"):
+            try:
+                return _to_text(getattr(content, "content"))
+            except Exception:
+                pass
+
+        # Dict-like structures: check a few likely fields
+        if isinstance(content, dict):
+            for key in ("output", "text", "content", "result", "message", "response"):
+                if key in content and content[key]:
+                    return _to_text(content[key])
+            # Some Vertex responses contain "candidates" -> [ {"content": ...} ]
+            candidates = content.get("candidates") if "candidates" in content else None
+            if candidates:
+                return _to_text(candidates)
+            # Fallback to stringifying the dict
+            return str(content)
+
+        # Lists: flatten recursively
+        if isinstance(content, list):
+            parts = [
+                _to_text(part)
+                for part in content
+                if part is not None and _to_text(part) is not None
+            ]
+            # Filter out empties while preserving spacing
+            return " ".join(p for p in parts if p)
+
+        # Anything else: best-effort string
+        return str(content)
+    except Exception:
+        # Absolute fallback: never propagate parsing errors to the call site
+        try:
+            return str(content)
+        except Exception:
+            return ""
 
 # This dictionary will hold the chat history for each active call
 conversation_history = {}
@@ -214,6 +278,14 @@ async def handle_agent_response(transcript: str, call_sid: str, stream_sid: str,
                 raise AttributeError(f"Agent returned a list: {agent_response}")
 
             tts_text = _to_text(agent_response)
+            if not tts_text or not tts_text.strip():
+                # Try a few more common fields/paths defensively
+                fallback = None
+                if isinstance(agent_response, dict):
+                    fallback = agent_response.get("output") or agent_response.get("text")
+                if not fallback:
+                    fallback = str(agent_response)
+                tts_text = _to_text(fallback)
         except AttributeError as e:
             # Common when underlying Google client returns a list payload on error
             logging.error(f"AttributeError during agent response (likely malformed error payload): {e}")
