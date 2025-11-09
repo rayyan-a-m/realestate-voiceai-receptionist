@@ -3,6 +3,10 @@
 langchain==0.1.20
 langchain-core==0.1.52
 langchain-google-vertexai==1.0.1
+# Keep community and text-splitters in the matching legacy range
+langchain-community>=0.0.38,<0.1
+langchain-text-splitters==0.0.2
+langsmith==0.1.147
 fastapi>=0.111.0
 uvicorn>=0.29.0
 python-dotenv>=1.0.1
@@ -19,4 +23,6 @@ pytz
 sounddevice>=0.4.6
 numpy>=1.26.0
 webrtcvad>=2.0.10
-langchain-community==0.0.36
+
+# Vertex AI Python SDK (provides `vertexai` and agent_engines)
+google-cloud-aiplatform>=1.61.0,<2.0.0
