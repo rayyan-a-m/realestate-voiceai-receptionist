@@ -271,6 +271,7 @@ async def handle_agent_response(transcript: str, call_sid: str, stream_sid: str,
         try:
             # Use the global agent instance
             agent_response = await asyncio.to_thread(agent.query, input=transcript)
+            logging.info(f"Agent response for call {call_sid}: {agent_response}")
 
             # The agent may return a list on error. If so, handle it as a failure.
             if isinstance(agent_response, list):
@@ -278,6 +279,7 @@ async def handle_agent_response(transcript: str, call_sid: str, stream_sid: str,
                 raise AttributeError(f"Agent returned a list: {agent_response}")
 
             tts_text = _to_text(agent_response)
+            logging.info(f"Normalized agent response to text: '{tts_text}'")
             if not tts_text or not tts_text.strip():
                 # Try a few more common fields/paths defensively
                 fallback = None
