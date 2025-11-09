@@ -14,6 +14,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 import pytz
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from twilio.twiml.voice_response import VoiceResponse, Connect
@@ -98,6 +99,12 @@ def _to_text(content) -> str:
 
 # This dictionary will hold the chat history for each active call
 conversation_history = {}
+
+# --- Healthcheck & Root ---
+@app.get("/")
+async def root_healthcheck():
+    """Simple healthcheck endpoint for Render and uptime monitors."""
+    return JSONResponse({"status": "ok"})
 
 # --- Outbound Campaign Management ---
 outbound_leads_queue = asyncio.Queue()
@@ -201,23 +208,31 @@ async def handle_agent_response(transcript: str, call_sid: str, stream_sid: str,
             # Use the global agent instance
             agent_response = await asyncio.to_thread(agent.query, input=transcript)
             tts_text = _to_text(agent_response)
-
-            logging.info(f"Agent for call {call_sid} says: {tts_text}")
-            
-            # Update chat history
-            chat_history = conversation_history.get(call_sid, [])
-            chat_history.append(HumanMessage(content=transcript))
-            chat_history.append(AIMessage(content=tts_text))
-            conversation_history[call_sid] = chat_history
-
-            was_interrupted = await generate_and_stream_audio(tts_text, websocket, stream_sid, interruption_event)
-
-            if was_interrupted:
-                await send_clear_message(websocket, stream_sid)
-                logging.info(f"Agent speech for {call_sid} was interrupted.")
-
+        except AttributeError as e:
+            # Common when underlying Google client returns a list payload on error
+            logging.error(f"AttributeError during agent response (likely malformed error payload): {e}")
+            tts_text = (
+                "I'm sorry, I had trouble processing that. Could you please repeat, or let me know if you'd like to book a property visit?"
+            )
         except Exception as e:
             logging.error(f"Error in agent task for call {call_sid}: {e}", exc_info=True)
+            tts_text = (
+                "I ran into a technical issue. Could you restate that, or tell me a good time you'd like to visit a property?"
+            )
+
+        logging.info(f"Agent for call {call_sid} says: {tts_text}")
+
+        # Update chat history
+        chat_history = conversation_history.get(call_sid, [])
+        chat_history.append(HumanMessage(content=transcript))
+        chat_history.append(AIMessage(content=tts_text))
+        conversation_history[call_sid] = chat_history
+
+        was_interrupted = await generate_and_stream_audio(tts_text, websocket, stream_sid, interruption_event)
+
+        if was_interrupted:
+            await send_clear_message(websocket, stream_sid)
+            logging.info(f"Agent speech for {call_sid} was interrupted.")
 
     # Return the task and the interruption event so the main loop can manage it
     return asyncio.create_task(agent_task()), interruption_event
