@@ -1,5 +1,5 @@
 import asyncio
-from queue import Queue # Use standard queue for thread-safe operations
+from asyncio import Queue # Use asyncio's queue for async operations
 import os
 import base64
 import json
