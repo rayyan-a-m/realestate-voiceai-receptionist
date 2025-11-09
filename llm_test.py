@@ -50,6 +50,8 @@ async def test_llm_connection():
         logging.info("Querying agent with a test message...")
         response = agent.query(input="Hello, can you hear me? Respond with a simple confirmation.")
         # response could be a string or dict depending on version
+        logging.info(f"Agent response received: {response}")
+        logging.info(f"LLM Agent response type - {type(response)}.")
         if isinstance(response, dict):
             response_content = response.get("output", "")
         else:

@@ -270,6 +270,7 @@ async def handle_agent_response(transcript: str, call_sid: str, stream_sid: str,
         logging.info(f"Querying agent for call {call_sid} with: '{transcript}'")
         try:
             # Use the global agent instance
+            logging.info(f"starting Querying agent for call {call_sid}")
             agent_response = await asyncio.to_thread(agent.query, input=transcript)
             logging.info(f"Agent response for call {call_sid}: {agent_response}")
 
