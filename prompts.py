@@ -6,11 +6,12 @@ def get_property_details_as_string():
     details = []
     for prop in PROPERTIES:
         details.append(
-            f"- Project Name: {prop['name']}\n"
-            f"  Type: {prop['type']}\n"
-            f"  Location: {prop['location']}\n"
-            f"  Description: {prop['description']}\n"
-            f"  Key Selling Point: {prop['talking_point']}"
+            f"- Property ID: {prop['id']}\n"
+            f"  Address: {prop['address']}\n"
+            f"  Bedrooms: {prop['bedrooms']}\n"
+            f"  Bathrooms: {prop['bathrooms']}\n"
+            f"  Price: ${prop['price']:,}\n"
+            f"  Features: {prop['features']}"
         )
     return "\n\n".join(details)
 
