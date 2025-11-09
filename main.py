@@ -1,5 +1,5 @@
 import asyncio
-from asyncio import Queue # Use asyncio's queue for async operations
+from queue import Queue # Use standard queue for thread-safe operations
 import os
 import base64
 import json
@@ -241,24 +241,29 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
     """Handles the full lifecycle of a voice call using Google STT/TTS with interruption."""
     logging.info(f"Starting agent task for call {call_sid}, stream {stream_sid}")
     
-    audio_queue = Queue() # Use a thread-safe queue
+    audio_queue = Queue()
     stop_event = asyncio.Event()
     active_agent_task = None
     interruption_event = None
 
+    # --- Audio Receiver (Async) ---
     async def audio_receiver():
-        """Receives audio from Twilio and puts it into a queue."""
+        """Receives audio from Twilio and puts it into a standard queue."""
         logging.info(f"Audio receiver started for {call_sid}")
         try:
             while not stop_event.is_set():
                 message_str = await websocket.receive_text()
                 data = json.loads(message_str)
                 event = data.get("event")
+
                 if event == "media":
                     payload = data["media"]["payload"]
-                    audio_queue.put(base64.b64decode(payload)) # Put data into the thread-safe queue
+                    audio_queue.put(base64.b64decode(payload))
+                elif event == "start":
+                     # This is handled in the main websocket_endpoint now
+                    pass
                 elif event == "stop":
-                    logging.info(f"Twilio stop event received for call {call_sid}")
+                    logging.info(f"Twilio 'stop' event received for call {call_sid}")
                     stop_event.set()
                     break
         except WebSocketDisconnect:
@@ -266,96 +271,106 @@ async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_s
         except Exception as e:
             logging.error(f"Error in audio_receiver for {call_sid}: {e}")
         finally:
-            stop_event.set()
-            audio_queue.put(None) # Signal end of audio
+            audio_queue.put(None) # Signal the end of audio
             logging.info(f"Audio receiver stopped for {call_sid}")
 
-    # Helper class to bridge async generator with sync gRPC client
-    class AsyncAudioStream:
-        def __init__(self, audio_queue: Queue, stop_event: asyncio.Event):
-            self._queue = audio_queue
-            self._stop_event = stop_event
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            if self._stop_event.is_set():
-                raise StopIteration
-
-            try:
-                # This runs in a thread, so we need to run the async `get`
-                # in the main event loop and wait for the result.
-                future = asyncio.run_coroutine_threadsafe(self._queue.get(), asyncio.get_running_loop())
-                chunk = future.result() # Blocks until an item is available
+    # --- STT Worker (Sync, runs in a separate thread) ---
+    def stt_worker():
+        """Processes audio from the queue using Google STT in a blocking manner."""
+        
+        def audio_generator():
+            """Yields audio chunks from the queue for the STT client."""
+            while not stop_event.is_set():
+                chunk = audio_queue.get()
                 if chunk is None:
-                    raise StopIteration
-                return speech.StreamingRecognizeRequest(audio_content=chunk)
-            except Exception:
-                raise StopIteration
+                    return
+                yield speech.StreamingRecognizeRequest(audio_content=chunk)
+                audio_queue.task_done()
 
+        try:
+            stt_config = get_stt_config()
+            responses = speech_client.streaming_recognize(
+                config=stt_config,
+                requests=audio_generator(),
+            )
+
+            for response in responses:
+                if not response.results:
+                    continue
+                result = response.results[0]
+                if not result.alternatives:
+                    continue
+                
+                transcript = result.alternatives[0].transcript.strip()
+
+                if result.is_final and transcript:
+                    logging.info(f"Final transcript for {call_sid}: '{transcript}'")
+                    # Since this is a sync function, we need to run the async handler
+                    # in the main event loop.
+                    asyncio.run_coroutine_threadsafe(
+                        handle_final_transcript(transcript),
+                        asyncio.get_running_loop()
+                    )
+                    # Because single_utterance=True, the stream will close here.
+                    # We break to allow the worker to exit and be restarted for the next turn.
+                    break 
+
+        except Exception as e:
+            if "DEADLINE_EXCEEDED" in str(e):
+                logging.warning(f"STT stream deadline exceeded for {call_sid}. This is expected on silence.")
+            else:
+                logging.error(f"STT worker error for {call_sid}: {e}", exc_info=True)
+        finally:
+            logging.info(f"STT worker finished for {call_sid}.")
+            # Do not set stop_event here, let the main loop control it
+
+    # --- Final Transcript Handler (Async) ---
+    async def handle_final_transcript(transcript: str):
+        """Handles the logic for when a final transcript is received."""
+        nonlocal active_agent_task, interruption_event
+        try:
+            # If an agent is currently speaking, interrupt it.
+            if active_agent_task and interruption_event and not interruption_event.is_set():
+                logging.info(f"User interrupted. Setting interruption event for {call_sid}.")
+                interruption_event.set()
+                await active_agent_task  # Wait for the interrupted task to clean up
+
+            # Start a new agent response task
+            active_agent_task, interruption_event = await handle_agent_response(
+                transcript, call_sid, stream_sid, websocket
+            )
+        except Exception as e:
+            logging.error(f"Error handling final transcript for {call_sid}: {e}", exc_info=True)
+
+
+    # --- Main Task Logic ---
     receiver_task = asyncio.create_task(audio_receiver())
 
     try:
         # 1. Greet the user
         greeting_text = f"Hi, am I speaking with {lead_name}?"
-        interruption_event = asyncio.Event()
+        interruption_event = asyncio.Event() # Initial event for the greeting
         await generate_and_stream_audio(greeting_text, websocket, stream_sid, interruption_event)
 
-        # 2. Start the STT streaming recognition
-        requests = AsyncAudioStream(audio_queue, stop_event)
-        stt_config = get_stt_config()
-        
-        # Run the synchronous STT client in a separate thread
-        responses = await asyncio.to_thread(
-            speech_client.streaming_recognize,
-            config=stt_config,
-            requests=requests
-        )
-
-        # 3. Process STT responses
-        for response in responses: # This loop is now synchronous
-            if not response.results:
-                continue
-
-            result = response.results[0]
-            if not result.alternatives:
-                continue
-
-            transcript = result.alternatives[0].transcript.strip()
-
-            if result.is_final:
-                logging.info(f"Final transcript for {call_sid}: '{transcript}'")
-
-                # Create a coroutine to run the async logic
-                async def handle_final_transcript():
-                    nonlocal active_agent_task, interruption_event
-                    if active_agent_task and interruption_event:
-                        logging.info(f"User interrupted. Setting interruption event for {call_sid}.")
-                        interruption_event.set()
-                        await active_agent_task
-
-                    active_agent_task, interruption_event = await handle_agent_response(
-                        transcript, call_sid, stream_sid, websocket
-                    )
-                
-                # Run the async handler in the main event loop
-                asyncio.run_coroutine_threadsafe(handle_final_transcript(), asyncio.get_running_loop())
-
-            else:
-                logging.debug(f"Interim transcript for {call_sid}: '{transcript}'")
+        # 2. Start the STT worker loop
+        while not stop_event.is_set():
+            # Run the synchronous STT worker in a background thread
+            await asyncio.to_thread(stt_worker)
+            # After stt_worker finishes (due to single_utterance), it will loop
+            # and start a new recognition stream, unless the stop_event is set.
+            if stop_event.is_set():
+                break
+            # Small sleep to prevent tight looping if something goes wrong
+            await asyncio.sleep(0.1)
 
     except Exception as e:
-        logging.error(f"STT recognizer error for {call_sid}: {e}", exc_info=True)
+        logging.error(f"Error in transcription_agent_task for {call_sid}: {e}", exc_info=True)
     finally:
         stop_event.set()
         if receiver_task:
             await receiver_task
         if active_agent_task:
-            # Ensure the last agent task is awaited properly
-            await asyncio.sleep(1) # Give it a moment to complete
-            if not active_agent_task.done():
-                 await active_agent_task
+            await active_agent_task
         logging.info(f"Agent task finished for call {call_sid}.")
 
 
