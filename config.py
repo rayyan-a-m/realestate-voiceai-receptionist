@@ -57,7 +57,12 @@ TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 YOUR_BUSINESS_NAME = "Prestige Properties"
 APPOINTMENT_DURATION_MINUTES = 30
 TIMEZONE = "America/New_York" # e.g., "America/New_York", "Europe/London"
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile"
+]
 TOKEN_JSON_PATH = "token.json" # For user OAuth flow
 
 # --- Property Information (Static) ---

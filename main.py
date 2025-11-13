@@ -26,7 +26,7 @@ warnings.filterwarnings(
 )
 
 import pytz
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -34,8 +34,10 @@ from twilio.twiml.voice_response import VoiceResponse, Connect
 from twilio.rest import Client as TwilioClient
 import uvicorn
 import datetime
+from google_auth_oauthlib.flow import Flow
 
 from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.chat_history import InMemoryChatMessageHistory
 from vertexai import agent_engines
 import vertexai  # Needed for explicit project/location initialization
 
@@ -65,9 +67,11 @@ import vertexai  # Needed for explicit project/location initialization
 
 from google.cloud import speech
 from google.cloud import texttospeech
+from google.cloud import secretmanager
+import requests
 
 import config
-from prompts import prompt
+from prompts import prompt, SYSTEM_PROMPT
 from google_calendar import find_available_slots, book_appointment
 
 # --- Initialization ---
@@ -102,6 +106,19 @@ tts_client = texttospeech.TextToSpeechClient(credentials=google_credentials)
 logging.info("Service clients initialized.")
 
 # --- LangChain Agent Setup ---
+# A dictionary to store chat histories. In a production environment,
+# you would use a more persistent storage solution.
+session_histories = {}
+
+def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
+    """
+    Retrieves a chat history for a given session ID, creating a new one if it
+    doesn't exist.
+    """
+    if session_id not in session_histories:
+        session_histories[session_id] = InMemoryChatMessageHistory()
+    return session_histories[session_id]
+
 try:
     if not config.GCP_PROJECT_ID:
         raise RuntimeError("Missing GCP_PROJECT_ID; cannot create LangchainAgent.")
@@ -114,7 +131,8 @@ try:
                 "max_output_tokens": 256,
                 "top_p": 0.95,
             },
-        system_instruction=prompt.messages[0].prompt.template
+        system_instruction=SYSTEM_PROMPT,
+        chat_history=get_session_history
     )
     logging.info(f"Vertex AI LangchainAgent initialized successfully with model '{config.VERTEX_MODEL}'.")
 except Exception as e:
@@ -190,42 +208,12 @@ def _to_text(content) -> str:
         except Exception:
             return ""
 
-# This dictionary will hold the chat history for each active call
-conversation_history = {}
-
 # --- Healthcheck & Root ---
 @app.get("/")
 async def root_healthcheck():
     """Simple healthcheck endpoint for Render and uptime monitors."""
     return JSONResponse({"status": "ok"})
 
-# --- Outbound Campaign Management ---
-outbound_leads_queue = asyncio.Queue()
-campaign_in_progress = False
-
-async def campaign_worker():
-    global campaign_in_progress
-    campaign_in_progress = True
-    logging.info("Starting outbound campaign worker...")
-    while not outbound_leads_queue.empty():
-        lead = await outbound_leads_queue.get()
-        logging.info(f"Processing lead: {lead['first_name']} {lead['last_name']} at {lead['phone']}")
-        try:
-            # Note: Update wss URL to your deployed server's URL
-            websocket_url = f"wss://realestate-voiceai-receptionist.onrender.com/ws?name={lead['first_name']}"
-            twiml_response = VoiceResponse()
-            connect = Connect()
-            connect.stream(url=websocket_url)
-            twiml_response.append(connect)
-            logging.info(f"Initiating outbound call to {lead['phone']} with TwiML: {str(twiml_response)}")
-            call = twilio_client.calls.create(to=lead['phone'], from_=config.TWILIO_PHONE_NUMBER, twiml=str(twiml_response))
-            logging.info(f"Outbound call initiated to {lead['phone']}, SID: {call.sid}")
-            await asyncio.sleep(15) # Wait before processing the next lead
-        except Exception as e:
-            logging.error(f"Failed to call lead {lead['first_name']}: {e}", exc_info=True)
-        outbound_leads_queue.task_done()
-    logging.info("Outbound campaign finished.")
-    campaign_in_progress = False
 
 # --- Real-time Transcription & Agent Logic ---
 
@@ -300,7 +288,11 @@ async def handle_agent_response(transcript: str, call_sid: str, stream_sid: str,
         try:
             # Use the global agent instance
             logging.info(f"starting Querying agent for call {call_sid}")
-            agent_response = await asyncio.to_thread(agent.query, input=transcript)
+            agent_response = await asyncio.to_thread(
+                agent.query,
+                input=transcript,
+                config={"configurable": {"session_id": call_sid}},
+            )
             logging.info(f"Agent response for call {call_sid}: {agent_response}")
 
             # The agent may return a list on error. If so, handle it as a failure.
@@ -332,12 +324,6 @@ async def handle_agent_response(transcript: str, call_sid: str, stream_sid: str,
 
         logging.info(f"Agent for call {call_sid} says: {tts_text}")
 
-        # Update chat history
-        chat_history = conversation_history.get(call_sid, [])
-        chat_history.append(HumanMessage(content=transcript))
-        chat_history.append(AIMessage(content=tts_text))
-        conversation_history[call_sid] = chat_history
-
         was_interrupted = await generate_and_stream_audio(tts_text, websocket, stream_sid, interruption_event)
 
         if was_interrupted:
@@ -364,7 +350,7 @@ def get_stt_config():
 
 async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_sid: str, lead_name: str | None = None):
     """Handles the full lifecycle of a voice call using Google STT/TTS with interruption."""
-    logging.info(f"Starting agent task for call {call_sid}, stream {stream_sid}")
+    logging.info(f"Starting agent task for call {call_sid}, stream {stream_sid}, name: {lead_name}")
     
     main_loop = asyncio.get_running_loop()
     audio_queue = Queue()
@@ -507,15 +493,22 @@ async def handle_inbound_call():
     response = VoiceResponse()
     connect = Connect()
     # Ensure the websocket URL is correct for your deployment
-    connect.stream(url=f"wss://realestate-voiceai-receptionist.onrender.com/ws")
+    connect.stream(url=f"wss://realestate-voiceai-receptionist.onrender.com/ws?type=INBOUND")
     response.append(connect)
     return Response(content=str(response), media_type="application/xml")
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, name: str = "Inbound"):
+async def websocket_endpoint(websocket: WebSocket, name: str = "z", type: str = "INBOUND"):
     """Handles the WebSocket connection from Twilio."""
     await websocket.accept()
-    logging.info(f"WebSocket connection accepted. Lead name: {name}")
+
+    # ✅ Parse 'name' from the query string manually
+    query_params = dict(websocket.query_params)
+    call_type = query_params.get("type", "INBOUND")
+    if call_type == "OUTBOUND":
+        name = query_params.get("name", "z")
+
+    logging.info(f"WebSocket connection accepted. Lead name: {name}, Type: {call_type}")
     call_sid = "Unknown"
     stream_sid = "Unknown"
     
@@ -547,9 +540,6 @@ async def websocket_endpoint(websocket: WebSocket, name: str = "Inbound"):
         stream_sid = start_data.get("streamSid", "Unknown")
         logging.info(f"Twilio 'start' event received for call {call_sid}, stream {stream_sid}")
 
-        # Initialize conversation history for this call
-        conversation_history[call_sid] = []
-
         # Start the main transcription and agent processing task
         await transcription_agent_task(websocket, call_sid, stream_sid, name)
 
@@ -559,10 +549,171 @@ async def websocket_endpoint(websocket: WebSocket, name: str = "Inbound"):
         logging.error(f"Error in WebSocket endpoint for call {call_sid}: {e}", exc_info=True)
     finally:
         logging.info(f"WebSocket endpoint closing for call SID: {call_sid}.")
-        # Clean up conversation history
-        if call_sid in conversation_history:
-            del conversation_history[call_sid]
-            logging.info(f"Cleaned up conversation history for call {call_sid}.")
+        if call_sid in session_histories:
+            del session_histories[call_sid]
+            logging.info(f"Cleaned up chat history for call {call_sid}.")
+
+
+# --- Google Calendar OAuth 2.0 Endpoints ---
+
+# NOTE: In a production environment, the REDIRECT_URI must be a public URL
+# that you have registered in your Google Cloud Console for the OAuth client.
+# For local testing, you can use a tool like ngrok to expose your localhost.
+CLIENT_SECRETS_FILE = "credentials.json"
+# The redirect URI must match *exactly* one of the authorized redirect URIs
+# for the OAuth 2.0 client, which you configure in the Google Cloud console.
+REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://realestate-voiceai-receptionist.onrender.com/oauth2callback")
+
+
+# CLIENT URL
+@app.get("/auth", tags=["Google Calendar Auth"])
+def auth(request: Request):
+    """
+    Generates the Google OAuth 2.0 authorization URL.
+    Redirect the user to this URL to start the consent process.
+    """
+    # The state parameter is used to prevent CSRF attacks.
+    # You can use it to store session-specific information.
+    # Here we use the client's host as a simple state.
+    state = request.client.host
+    flow = Flow.from_client_secrets_file(
+        CLIENT_SECRETS_FILE,
+        scopes=config.SCOPES,
+        redirect_uri=REDIRECT_URI
+    )
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        # You can pass the state here if you need to
+        # state=state
+    )
+    logging.info(f"Generated OAuth URL for {request.client.host}: {auth_url}")
+    return {"auth_url": auth_url}
+
+
+@app.get("/oauth2callback", tags=["Google Calendar Auth"])
+async def oauth2callback(request: Request):
+    """
+    Handles the callback from Google after the user grants consent.
+    Fetches the OAuth 2.0 token and saves it for the client.
+    """
+    # The full URL of the request is required to fetch the token.
+    authorization_response = str(request.url)
+    
+    # For security, ensure the response is sent over HTTPS in production
+    if "http://" in authorization_response and "localhost" not in authorization_response:
+        logging.warning("OAuth callback received over HTTP. In production, this should be HTTPS.")
+        # In a production environment, you might want to enforce HTTPS:
+        # raise HTTPException(status_code=400, detail="OAuth callback must be over HTTPS")
+
+    flow = Flow.from_client_secrets_file(
+        CLIENT_SECRETS_FILE,
+        scopes=config.SCOPES,
+        redirect_uri=REDIRECT_URI
+    )
+    
+    try:
+        flow.fetch_token(authorization_response=authorization_response)
+    except Exception as e:
+        logging.error(f"Failed to fetch OAuth token: {e}", exc_info=True)
+        return JSONResponse(status_code=400, content={"message": "Failed to fetch OAuth token."})
+
+    credentials = flow.credentials
+
+    logging.info(f"OAuth token fetched successfully for client - {credentials}")
+
+    # --- Securely Store Client Credentials in Google Secret Manager ---
+    try:
+        # Initialize Secret Manager client
+        secret_client = secretmanager.SecretManagerServiceClient(credentials=google_credentials)
+        
+        # Use the user's email as a unique identifier.
+        # First, get the user's info using the access token.
+        userinfo_response = requests.get(
+            "https://www.googleapis.com/oauth2/v3/userinfo",
+            headers={"Authorization": f"Bearer {credentials.token}"}
+        )
+        userinfo = userinfo_response.json()
+        client_email = userinfo.get("email")
+
+        if not client_email:
+            logging.error("Could not retrieve user email from token.")
+            return JSONResponse(status_code=400, content={"message": "Could not retrieve user email."})
+
+        logging.info(f"Identified user for token storage: {client_email}")
+
+        # Sanitize the email to create a valid Secret ID
+        # (Secret IDs can only contain letters, numbers, hyphens, and underscores)
+        secret_id = f"oauth-token-{client_email.replace('@', '-').replace('.', '-')}"
+        
+        # The parent project for the secret
+        parent = f"projects/{config.GCP_PROJECT_ID}"
+        secret_name = f"{parent}/secrets/{secret_id}"
+
+        token_data = {
+            "token": credentials.token,
+            "refresh_token": credentials.refresh_token,
+            "token_uri": credentials.token_uri,
+            "client_id": credentials.client_id,
+            "client_secret": credentials.client_secret,
+            "scopes": credentials.scopes
+        }
+        payload = json.dumps(token_data).encode("UTF-8")
+
+        # Check if the secret exists. If not, create it.
+        try:
+            secret_client.get_secret(request={"name": secret_name})
+            logging.info(f"Secret '{secret_id}' already exists. Adding a new version.")
+        except Exception: # google.api_core.exceptions.NotFound
+            logging.info(f"Secret '{secret_id}' not found. Creating it now.")
+            secret_client.create_secret(
+                request={
+                    "parent": parent,
+                    "secret_id": secret_id,
+                    "secret": {"replication": {"automatic": {}}},
+                }
+            )
+        
+        # Add the token data as a new version of the secret
+        secret_client.add_secret_version(
+            request={"parent": secret_name, "payload": {"data": payload}}
+        )
+        
+        logging.info(f"Successfully saved token for client '{client_email}' to Secret Manager as '{secret_id}'")
+
+    except Exception as e:
+        logging.error(f"Failed to save token to Secret Manager: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"message": "Failed to save token to Secret Manager."})
+
+    return {"message": "Google Calendar connected successfully and token stored securely!"}
+
+# --- Outbound Campaign Management ---
+outbound_leads_queue = asyncio.Queue()
+campaign_in_progress = False
+
+async def campaign_worker():
+    global campaign_in_progress
+    campaign_in_progress = True
+    logging.info("Starting outbound campaign worker...")
+    while not outbound_leads_queue.empty():
+        lead = await outbound_leads_queue.get()
+        logging.info(f"Processing lead: {lead['first_name']} {lead['last_name']} at {lead['phone']}")
+        try:
+            # Note: Update wss URL to your deployed server's URL
+            websocket_url = f"wss://realestate-voiceai-receptionist.onrender.com/ws?name={lead['first_name']}&type=OUTBOUND"
+            twiml_response = VoiceResponse()
+            connect = Connect()
+            connect.stream(url=websocket_url)
+            twiml_response.append(connect)
+            logging.info(f"Initiating outbound call to {lead['phone']} with TwiML: {str(twiml_response)}")
+            call = twilio_client.calls.create(to=lead['phone'], from_=config.TWILIO_PHONE_NUMBER, twiml=str(twiml_response))
+            logging.info(f"Outbound call initiated to {lead['phone']}, SID: {call.sid}")
+            await asyncio.sleep(15) # Wait before processing the next lead
+        except Exception as e:
+            logging.error(f"Failed to call lead {lead['first_name']}: {e}", exc_info=True)
+        outbound_leads_queue.task_done()
+    logging.info("Outbound campaign finished.")
+    campaign_in_progress = False
 
 @app.post("/start_outbound_campaign")
 async def start_outbound_campaign(file: UploadFile = File(...)):
@@ -571,6 +722,7 @@ async def start_outbound_campaign(file: UploadFile = File(...)):
         return {"status": "error", "message": "A campaign is already in progress."}
     logging.info("Received request to start outbound campaign.")
     try:
+        # Reaading file content from csv
         content = await file.read()
         file_data = io.StringIO(content.decode("utf-8"))
         reader = csv.DictReader(file_data)

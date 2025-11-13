@@ -2,12 +2,15 @@ import os
 import datetime
 import pytz
 import logging
+import json
 from langchain_core.tools import tool
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from google.cloud import secretmanager
 
+import config
 from config import APPOINTMENT_DURATION_MINUTES, TIMEZONE
 
 # Configure logging
@@ -15,25 +18,60 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # --- Google Calendar API Setup ---
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
+# The ID of the secret in Google Secret Manager containing the OAuth token JSON.
+OAUTH_TOKEN_SECRET_ID = os.getenv("OAUTH_TOKEN_SECRET_ID")
+
 
 def get_calendar_service():
-    """Gets an authorized Google Calendar service instance."""
+    """
+    Gets an authorized Google Calendar service instance.
+
+    Priority order for credentials:
+    1. Fetches from Google Secret Manager if OAUTH_TOKEN_SECRET_ID is set.
+    2. Reads from a local 'token.json' file.
+    3. Initiates a new OAuth 2.0 flow as a last resort.
+    """
     creds = None
-    if os.path.exists("token.json"):
-        logging.info("Found token.json, loading credentials.")
+
+    # 1. Try to load from Google Secret Manager
+    if OAUTH_TOKEN_SECRET_ID and config.GCP_PROJECT_ID:
+        try:
+            logging.info(f"Attempting to load OAuth token from Secret Manager: '{OAUTH_TOKEN_SECRET_ID}'")
+            client = secretmanager.SecretManagerServiceClient(credentials=config.GOOGLE_CREDENTIALS)
+            secret_name = f"projects/{config.GCP_PROJECT_ID}/secrets/{OAUTH_TOKEN_SECRET_ID}/versions/latest"
+            response = client.access_secret_version(request={"name": secret_name})
+            token_data = json.loads(response.payload.data.decode("UTF-8"))
+            creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+            logging.info("Successfully loaded credentials from Secret Manager.")
+        except Exception as e:
+            logging.error(f"Failed to load token from Secret Manager. Falling back. Error: {e}", exc_info=True)
+
+    # 2. If Secret Manager fails or is not configured, try local token.json
+    if not creds and os.path.exists("token.json"):
+        logging.info("Found token.json, loading credentials from file.")
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-    
+
+    # 3. Refresh or run new OAuth flow if credentials are not valid
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             logging.info("Credentials expired, refreshing token.")
             creds.refresh(Request())
         else:
-            logging.info("No valid credentials found, running OAuth flow.")
+            logging.info("No valid credentials found, running new OAuth flow.")
+            # This part is for local development and should not run in production
+            if not os.path.exists("credentials.json"):
+                logging.error("FATAL: credentials.json not found. Cannot initiate OAuth flow.")
+                raise FileNotFoundError("credentials.json is required to create a new token.")
             flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
             creds = flow.run_local_server(port=0)
-        with open("token.json", "w") as token:
-            logging.info("Saving new credentials to token.json.")
-            token.write(creds.to_json())
+        
+        # Save the new/refreshed credentials to token.json for local cache
+        try:
+            with open("token.json", "w") as token:
+                logging.info("Saving/updating credentials to token.json.")
+                token.write(creds.to_json())
+        except IOError as e:
+            logging.error(f"Could not write to token.json: {e}")
             
     return build("calendar", "v3", credentials=creds)
 
