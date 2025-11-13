@@ -19,7 +19,9 @@ google-auth-httplib2>=0.2.0
 google-auth-oauthlib>=1.2.0
 google-cloud-speech>=2.25.0
 google-cloud-texttospeech>=2.16.0
-pytz
+google-cloud-secret-manager>=2.16.0
+requests>=2.31.0
+pytz>=2024.1
 sounddevice>=0.4.6
 numpy>=1.26.0
 webrtcvad>=2.0.10
