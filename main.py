@@ -493,20 +493,21 @@ async def handle_inbound_call():
     response = VoiceResponse()
     connect = Connect()
     # Ensure the websocket URL is correct for your deployment
-    connect.stream(url=f"wss://realestate-voiceai-receptionist.onrender.com/ws?type=INBOUND")
+    connect.stream(url=f"wss://realestate-voiceai-receptionist.onrender.com/ws?call_type=INBOUND")
     response.append(connect)
     return Response(content=str(response), media_type="application/xml")
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, name: str = "z", type: str = "INBOUND"):
+async def websocket_endpoint(websocket: WebSocket, name: str = "z", call_type: str = "INBOUND"):
     """Handles the WebSocket connection from Twilio."""
     await websocket.accept()
 
     # ✅ Parse 'name' from the query string manually
     query_params = dict(websocket.query_params)
+    logging.info(f"WebSocket query parameters: {query_params}")
     call_type = query_params.get("type", "INBOUND")
     if call_type == "OUTBOUND":
-        name = query_params.get("name", "z")
+        name = query_params.get("name", "y")
 
     logging.info(f"WebSocket connection accepted. Lead name: {name}, Type: {call_type}")
     call_sid = "Unknown"
@@ -559,7 +560,7 @@ async def websocket_endpoint(websocket: WebSocket, name: str = "z", type: str = 
 # NOTE: In a production environment, the REDIRECT_URI must be a public URL
 # that you have registered in your Google Cloud Console for the OAuth client.
 # For local testing, you can use a tool like ngrok to expose your localhost.
-CLIENT_SECRETS_FILE = os.getenv("GOOGLE_CREDENTIALS_JSON")
+CLIENT_SECRETS_FILE = os.getenv("GOOGLE_OAUTH_WEB_CLIENT_SECRETS") #"credentials.json"
 credentials_info = json.loads(CLIENT_SECRETS_FILE)
 # The redirect URI must match *exactly* one of the authorized redirect URIs
 # for the OAuth 2.0 client, which you configure in the Google Cloud console.
@@ -701,7 +702,7 @@ async def campaign_worker():
         logging.info(f"Processing lead: {lead['first_name']} {lead['last_name']} at {lead['phone']}")
         try:
             # Note: Update wss URL to your deployed server's URL
-            websocket_url = f"wss://realestate-voiceai-receptionist.onrender.com/ws?name={lead['first_name']}&type=OUTBOUND"
+            websocket_url = f"wss://realestate-voiceai-receptionist.onrender.com/ws?name={lead['first_name']}&call_type=OUTBOUND"
             twiml_response = VoiceResponse()
             connect = Connect()
             connect.stream(url=websocket_url)
