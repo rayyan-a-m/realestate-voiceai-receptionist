@@ -559,7 +559,8 @@ async def websocket_endpoint(websocket: WebSocket, name: str = "z", type: str = 
 # NOTE: In a production environment, the REDIRECT_URI must be a public URL
 # that you have registered in your Google Cloud Console for the OAuth client.
 # For local testing, you can use a tool like ngrok to expose your localhost.
-CLIENT_SECRETS_FILE = "credentials.json"
+CLIENT_SECRETS_FILE = os.getenv("GOOGLE_CREDENTIALS_JSON")
+credentials_info = json.loads(CLIENT_SECRETS_FILE)
 # The redirect URI must match *exactly* one of the authorized redirect URIs
 # for the OAuth 2.0 client, which you configure in the Google Cloud console.
 REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://realestate-voiceai-receptionist.onrender.com/oauth2callback")
@@ -576,8 +577,8 @@ def auth(request: Request):
     # You can use it to store session-specific information.
     # Here we use the client's host as a simple state.
     state = request.client.host
-    flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE,
+    flow = Flow.from_client_config(
+        credentials_info,
         scopes=config.SCOPES,
         redirect_uri=REDIRECT_URI
     )
@@ -606,8 +607,8 @@ async def oauth2callback(request: Request):
         # In a production environment, you might want to enforce HTTPS:
         # raise HTTPException(status_code=400, detail="OAuth callback must be over HTTPS")
 
-    flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE,
+    flow = Flow.from_client_config(
+        credentials_info,
         scopes=config.SCOPES,
         redirect_uri=REDIRECT_URI
     )
