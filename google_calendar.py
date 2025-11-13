@@ -11,7 +11,7 @@ from googleapiclient.discovery import build
 from google.cloud import secretmanager
 
 import config
-from config import APPOINTMENT_DURATION_MINUTES, TIMEZONE
+from config import APPOINTMENT_DURATION_MINUTES, TIMEZONE, PROPERTIES
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -20,6 +20,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 # The ID of the secret in Google Secret Manager containing the OAuth token JSON.
 OAUTH_TOKEN_SECRET_ID = os.getenv("OAUTH_TOKEN_SECRET_ID")
+
+
+def get_property_by_id(property_id: str):
+    """Helper function to find a property by its ID."""
+    for prop in PROPERTIES:
+        if prop['id'] == property_id:
+            return prop
+    return None
 
 
 def get_calendar_service():
@@ -78,8 +86,11 @@ def get_calendar_service():
 @tool
 def find_available_slots() -> str:
     """
-    Finds the next 5 available 30-minute appointment slots starting from now.
-    This tool does not require any input. It checks the calendar 24/7.
+    Use this tool to find available appointment slots.
+
+    This tool is the ONLY way to check for appointment availability.
+    Do not guess or suggest times without calling this tool first.
+    It returns a string with the next 5 available 30-minute slots.
     """
     logging.info("Tool 'find_available_slots' invoked.")
     try:
@@ -142,16 +153,30 @@ def find_available_slots() -> str:
         return "Sorry, I encountered an error while trying to find available slots."
 
 @tool
-def book_appointment(datetime_str: str, full_name: str, email: str, property_name: str) -> str:
-    """Books a 30-minute property visit appointment.
+def book_appointment(datetime_str: str, full_name: str, email: str, property_id: str) -> str:
+    """
+    Use this tool to book a property visit appointment.
+
+    This is the final step in the booking process.
+    You MUST have the user's full name, email, the desired datetime_str,
+    and the property_id BEFORE calling this tool.
 
     Args:
-        datetime_str: The appointment time in 'YYYY-MM-DD HH:MM' format (24-hour clock).
+        datetime_str: The appointment time in 'YYYY-MM-DD HH:MM' format (24-hour clock),
+                      which MUST be one of the slots provided by 'find_available_slots'.
         full_name: The full name of the person booking the visit.
         email: The email address of the person.
-        property_name: The name of the property they want to visit.
+        property_id: The ID of the property they want to visit (e.g., 'PV001').
     """
-    logging.info(f"Tool 'book_appointment' invoked with: datetime='{datetime_str}', name='{full_name}', email='{email}', property='{property_name}'")
+    logging.info(f"Tool 'book_appointment' invoked with: datetime='{datetime_str}', name='{full_name}', email='{email}', property_id='{property_id}'")
+
+    property_details = get_property_by_id(property_id)
+    if not property_details:
+        logging.error(f"Invalid property_id '{property_id}' passed to book_appointment.")
+        return f"Error: I couldn't find a property with the ID '{property_id}'. Please confirm the property ID."
+
+    property_name = property_details.get('address', 'Unknown Property')
+
     try:
         service = get_calendar_service()
         start_time = datetime.datetime.strptime(datetime_str, "%Y-%m-%d %H:%M").astimezone(pytz.timezone(TIMEZONE))
@@ -162,7 +187,7 @@ def book_appointment(datetime_str: str, full_name: str, email: str, property_nam
 
     event = {
         'summary': f'Property Visit: {property_name} for {full_name}',
-        'description': f'Booked by AI Assistant "Sky".\nClient Email: {email}',
+        'description': f'Booked by AI Assistant "Sky".\nClient Email: {email}\nProperty ID: {property_id}',
         'start': {'dateTime': start_time.isoformat(), 'timeZone': TIMEZONE},
         'end': {'dateTime': end_time.isoformat(), 'timeZone': TIMEZONE},
         'attendees': [{'email': email}],
@@ -178,7 +203,7 @@ def book_appointment(datetime_str: str, full_name: str, email: str, property_nam
     try:
         created_event = service.events().insert(calendarId='primary', body=event, sendUpdates='all').execute()
         logging.info(f"Successfully created event with ID: {created_event.get('id')}")
-        return f"Success! The appointment for {full_name} at {datetime_str} has been booked. A calendar invite has been sent."
+        return f"Success! The appointment for {full_name} at {datetime_str} for the property at {property_name} has been booked. A calendar invite has been sent."
     except Exception as e:
         logging.error(f"Failed to create calendar event: {e}", exc_info=True)
         return "Sorry, I was unable to book the appointment. There was an error with the calendar service."

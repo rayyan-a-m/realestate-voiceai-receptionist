@@ -503,8 +503,11 @@ async def websocket_endpoint(websocket: WebSocket, name: str = "z", call_type: s
     """Handles the WebSocket connection from Twilio."""
     await websocket.accept()
 
+    from starlette.datastructures import QueryParams
+
     # ✅ Parse 'name' from the query string manually
-    query_params = dict(websocket.query_params)
+    query_params = QueryParams(websocket.scope["query_string"].decode())
+    # query_params = dict(websocket.query_params)
     logging.info(f"WebSocket query parameters: {query_params}")
     call_type = query_params.get("type", "INBOUND")
     if call_type == "OUTBOUND":
@@ -665,9 +668,10 @@ async def oauth2callback(request: Request):
 
         # Check if the secret exists. If not, create it.
         try:
+            logging.info(f"Checking if secret exists -  '{secret_name}' ")
             secret_client.get_secret(request={"name": secret_name})
             logging.info(f"Secret '{secret_id}' already exists. Adding a new version.")
-        except Exception: # google.api_core.exceptions.NotFound
+        except Exception as e: # google.api_core.exceptions.NotFound
             logging.info(f"Secret '{secret_id}' not found. Creating it now.")
             secret_client.create_secret(
                 request={
