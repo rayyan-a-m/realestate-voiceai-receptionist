@@ -4,6 +4,7 @@ import os
 import base64
 import json
 import csv
+from fastapi.responses import JSONResponse, RedirectResponse
 import io
 import logging
 import warnings
@@ -589,8 +590,8 @@ def auth(request: Request):
         # You can pass the state here if you need to
         # state=state
     )
-    logging.info(f"Generated OAuth URL for {request.client.host}: {auth_url}")
-    return {"auth_url": auth_url}
+    logging.info(f"Generated OAuth URL for {request.client.host}, redirecting...- {auth_url}")
+    return RedirectResponse(auth_url)
 
 
 @app.get("/oauth2callback", tags=["Google Calendar Auth"])
