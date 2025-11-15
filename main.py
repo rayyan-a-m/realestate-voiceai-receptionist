@@ -120,7 +120,7 @@ try:
     agent = create_tool_calling_agent(llm, tools, prompt)
 
     # This executor wraps the agent and handles tool execution
-    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
 
     # This adds memory to the agent
     agent_with_chat_history = RunnableWithMessageHistory(
@@ -237,7 +237,9 @@ async def generate_and_stream_audio(text: str, websocket: WebSocket, stream_sid:
     try:
         synthesis_input = texttospeech.SynthesisInput(text=text)
         voice = texttospeech.VoiceSelectionParams(
-            language_code="en-US", name="en-US-Standard-C"
+            language_code="en-US",
+            name="Charon",  # Example voice, adjust as needed
+            model_name="gemini-2.5-pro-tts"
         )
         audio_config = texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.MULAW,
@@ -481,19 +483,14 @@ async def handle_inbound_call():
     return Response(content=str(response), media_type="application/xml")
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, name: str = "z", call_type: str = "INBOUND"):
+async def websocket_endpoint(websocket: WebSocket):
     """Handles the WebSocket connection from Twilio."""
     await websocket.accept()
-
-    from starlette.datastructures import QueryParams
-
-    # ✅ Parse 'name' from the query string manually
-    query_params = QueryParams(websocket.scope["query_string"].decode())
-    # query_params = dict(websocket.query_params)
-    logging.info(f"WebSocket query parameters: {query_params}")
+    
+    # Manually parse query parameters from the WebSocket URL
+    query_params = dict(websocket.query_params)
+    name = query_params.get("name", "Valued Customer")
     call_type = query_params.get("call_type", "INBOUND")
-    if call_type == "OUTBOUND":
-        name = query_params.get("name", "y")
 
     logging.info(f"WebSocket connection accepted. Lead name: {name}, Type: {call_type}")
     call_sid = "Unknown"

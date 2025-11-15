@@ -84,73 +84,103 @@ def get_calendar_service():
     return build("calendar", "v3", credentials=creds)
 
 @tool
-def find_available_slots() -> str:
+def find_available_slots(date_str: str) -> str:
     """
-    Use this tool to find available appointment slots.
+    Use this tool to find available appointment slots on a specific day.
+
+    You MUST ask the user for a specific date before using this tool.
+
+    Args:
+        date_str: The date to check for availability in 'YYYY-MM-DD' format.
 
     This tool is the ONLY way to check for appointment availability.
     Do not guess or suggest times without calling this tool first.
-    It returns a string with the next 5 available 30-minute slots.
+    It returns a string with available 30-minute slots for the given day.
     """
-    logging.info("Tool 'find_available_slots' invoked.")
+    logging.info(f"Tool 'find_available_slots' invoked for date: {date_str}")
     try:
         service = get_calendar_service()
-        now = datetime.datetime.now(pytz.timezone(TIMEZONE))
+
+        # Parse the input date and set the time range for that day
+        try:
+            # Ensure date_str is just the date part if datetime is passed
+            if ' ' in date_str:
+                date_str = date_str.split(' ')[0]
+            search_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            logging.error(f"Invalid date format received: '{date_str}'")
+            return "Error: Invalid date format. Please ask the user for a date in 'YYYY-MM-DD' format."
+
+        tz = pytz.timezone(TIMEZONE)
+        # Define working hours (e.g., 9 AM to 5 PM)
+        day_start = tz.localize(datetime.datetime.combine(search_date, datetime.time(9, 0)))
+        day_end = tz.localize(datetime.datetime.combine(search_date, datetime.time(17, 0)))
         
-        # Search for the next 7 days
-        search_end = now + datetime.timedelta(days=7)
-        logging.info(f"Searching for free slots between {now.isoformat()} and {search_end.isoformat()}.")
+        # Ensure we don't search in the past
+        now = datetime.datetime.now(tz)
+        if day_start < now:
+            day_start = now
+
+        logging.info(f"Searching for free slots on {date_str} between {day_start.isoformat()} and {day_end.isoformat()}.")
 
         events_result = service.events().list(
             calendarId='primary',
-            timeMin=now.isoformat(),
-            timeMax=search_end.isoformat(),
+            timeMin=day_start.isoformat(),
+            timeMax=day_end.isoformat(),
             singleEvents=True,
             orderBy='startTime'
         ).execute()
         busy_slots = events_result.get('items', [])
-        logging.info(f"Found {len(busy_slots)} busy slots in the calendar.")
+        logging.info(f"Found {len(busy_slots)} busy slots in the calendar for {date_str}.")
 
         available_slots = []
-        # Start checking from the next whole 30-minute interval
-        potential_slot_time = now.replace(second=0, microsecond=0)
-        if potential_slot_time.minute >= 30:
-            potential_slot_time = potential_slot_time.replace(minute=30)
-        else:
-            potential_slot_time = potential_slot_time.replace(minute=0)
-        potential_slot_time += datetime.timedelta(minutes=30)
+        # Start checking from the beginning of the workday or now, whichever is later
+        potential_slot_time = day_start
+        # Align to the next 30-minute mark
+        if potential_slot_time.minute not in [0, 30]:
+             if potential_slot_time.minute > 30:
+                 potential_slot_time = potential_slot_time.replace(minute=30) + datetime.timedelta(minutes=30)
+             else:
+                 potential_slot_time = potential_slot_time.replace(minute=30)
         
-        limit = 5 # Find up to 5 slots
-        while potential_slot_time < search_end and len(available_slots) < limit:
+        while potential_slot_time < day_end:
             is_free = True
             slot_end_time = potential_slot_time + datetime.timedelta(minutes=APPOINTMENT_DURATION_MINUTES)
             
             for event in busy_slots:
-                event_start = datetime.datetime.fromisoformat(event['start'].get('dateTime')).astimezone(pytz.timezone(TIMEZONE))
-                event_end = datetime.datetime.fromisoformat(event['end'].get('dateTime')).astimezone(pytz.timezone(TIMEZONE))
+                event_start = datetime.datetime.fromisoformat(event['start'].get('dateTime')).astimezone(tz)
+                event_end = datetime.datetime.fromisoformat(event['end'].get('dateTime')).astimezone(tz)
                 
                 # Check for overlap
                 if max(potential_slot_time, event_start) < min(slot_end_time, event_end):
                     is_free = False
-                    # Use debug logging for verbose info
                     logging.debug(f"Slot at {potential_slot_time} conflicts with event '{event.get('summary')}' from {event_start} to {event_end}.")
-                    break
+                    # Move potential start time to the end of the conflicting event
+                    potential_slot_time = event_end
+                    # Re-align to 30-min interval
+                    if potential_slot_time.minute not in [0, 30]:
+                        if potential_slot_time.minute > 30:
+                            potential_slot_time = potential_slot_time.replace(hour=potential_slot_time.hour + 1, minute=0)
+                        else:
+                            potential_slot_time = potential_slot_time.replace(minute=30)
+                    break 
             
             if is_free:
-                available_slots.append(potential_slot_time.strftime('%Y-%m-%d %H:%M'))
-
-            potential_slot_time += datetime.timedelta(minutes=APPOINTMENT_DURATION_MINUTES)
+                # Add slot if it's within the working day
+                if potential_slot_time < day_end:
+                    available_slots.append(potential_slot_time.strftime('%H:%M'))
+                potential_slot_time += datetime.timedelta(minutes=APPOINTMENT_DURATION_MINUTES)
 
         if not available_slots:
-            logging.warning("No available slots found in the next 7 days.")
-            return "No available slots found in the next 7 days."
+            logging.warning(f"No available slots found for {date_str}.")
+            return f"I'm sorry, but there are no available slots on {date_str}. Would you like to check another date?"
 
-        result_str = f"Here are the next available slots: {', '.join(available_slots)}"
-        logging.info(f"Found available slots: {result_str}")
+        result_str = f"On {date_str}, the following times are available: {', '.join(available_slots)}."
+        logging.info(f"Found available slots for {date_str}: {result_str}")
         return result_str
     except Exception as e:
         logging.error(f"Error in find_available_slots: {e}", exc_info=True)
-        return "Sorry, I encountered an error while trying to find available slots."
+        return "Sorry, I encountered an error while trying to find available slots. Could you please try another date?"
 
 @tool
 def book_appointment(datetime_str: str, full_name: str, email: str, property_id: str) -> str:
