@@ -283,23 +283,29 @@ async def handle_agent_response(transcript: str, call_sid: str, stream_sid: str,
     # The agent task will run in the background
     async def agent_task():
         logging.info(f"Querying agent for call {call_sid} with: '{transcript}'")
+        tts_text = ""
         try:
-            # Use the new agent_with_chat_history
-            logging.info(f"starting Querying agent for call {call_sid}")
-            agent_response = await agent_with_chat_history.ainvoke(
+            # Use the streaming version of the agent
+            logging.info(f"Starting agent stream for call {call_sid}")
+            
+            full_response_parts = []
+            async for chunk in agent_with_chat_history.astream(
                 {"input": transcript},
                 config={"configurable": {"session_id": call_sid}},
-            )
-            logging.info(f"Agent response for call {call_sid}: {agent_response}")
+            ):
+                # The chunk is a dictionary. We are interested in the 'output' key from 'agent' steps
+                # or the final 'output' from the last step.
+                if "agent" in chunk and "output" in chunk["agent"]:
+                    # This is an intermediate step from the agent with a text response
+                    part = chunk["agent"]["output"]
+                    full_response_parts.append(part)
+                elif "output" in chunk:
+                    # This is the final output
+                    part = chunk["output"]
+                    full_response_parts.append(part)
 
-            # The new agent structure returns a dictionary, often with an 'output' key
-            if isinstance(agent_response, dict) and "output" in agent_response:
-                tts_text = agent_response["output"]
-            else:
-                # Fallback for unexpected structures
-                tts_text = _to_text(agent_response)
-
-            logging.info(f"Normalized agent response to text: '{tts_text}'")
+            tts_text = "".join(full_response_parts)
+            logging.info(f"Final assembled agent response for call {call_sid}: {tts_text}")
 
         except Exception as e:
             logging.error(f"Error in agent task for call {call_sid}: {e}", exc_info=True)
