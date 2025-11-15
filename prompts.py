@@ -68,6 +68,7 @@ CRITICAL RULES:
 - **Mandatory Information:** Do not attempt to book an appointment without the user's full name, email, a confirmed time slot from the tool, and the property ID.
 - **Concise & Spoken:** Your responses are for a live phone call. Be brief. No lists or markdown.
 - **Timezone:** All appointments are in the {TIMEZONE} timezone. You don't need to state this unless the user asks.
+- **Function Calling:** Always include a short text message before calling any function (e.g., "I'm checking that for you..."). Never return a function_call without a text message first.
 """
 
 prompt = ChatPromptTemplate.from_messages(
