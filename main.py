@@ -37,43 +37,24 @@ import uvicorn
 import datetime
 from google_auth_oauthlib.flow import Flow
 
-from langchain_core.messages import HumanMessage, AIMessage
+# --- LangChain & Vertex AI Imports ---
+from langchain_google_vertexai import ChatVertexAI
+from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.chat_history import InMemoryChatMessageHistory
-from vertexai import agent_engines
-import vertexai  # Needed for explicit project/location initialization
+from langchain_core.runnables.history import RunnableWithMessageHistory
+import vertexai
 
-
-# --- Agent Wrapper for Error Handling ---
-# class SafeLangchainAgent(agent_engines.LangchainAgent):
-#     """
-#     A wrapper around LangchainAgent to gracefully handle internal errors.
-
-#     The base LangchainAgent can raise an AttributeError if the underlying model
-#     returns an error payload (often a list) instead of a valid JSON response.
-#     This wrapper catches that specific error during the query and returns a
-#     structured error message, preventing the main application from crashing.
-#     """
-#     def query(self, *args, **kwargs):
-#         try:
-#             return super().query(*args, **kwargs)
-#         except AttributeError as e:
-#             # This error is typically raised when the agent's internal parser
-#             # receives an error list from the model instead of a dict.
-#             logging.error(f"Caught AttributeError inside LangchainAgent query: {e}")
-#             # Return a consistent error format that the rest of the app can handle.
-#             return {
-#                 "output": "I'm sorry, I encountered a processing error. Could you please try again?"
-#             }
-
-
+# --- Google Cloud Service Imports ---
 from google.cloud import speech
 from google.cloud import texttospeech
 from google.cloud import secretmanager
 import requests
 
+# --- Local Application Imports ---
 import config
-from prompts import prompt, SYSTEM_PROMPT
+from prompts import prompt
 from google_calendar import find_available_slots, book_appointment
+
 
 # --- Initialization ---
 app = FastAPI()
@@ -124,18 +105,32 @@ try:
     if not config.GCP_PROJECT_ID:
         raise RuntimeError("Missing GCP_PROJECT_ID; cannot create LangchainAgent.")
     
-    agent = agent_engines.LangchainAgent(
-        model=config.VERTEX_MODEL,
-        tools=[find_available_slots, book_appointment],
-        model_kwargs={
-                "temperature": 0.0,
-                "max_output_tokens": 256,
-                "top_p": 0.95,
-            },
-        system_instruction=SYSTEM_PROMPT,
-        chat_history=get_session_history
+    # New, more robust agent setup
+    llm = ChatVertexAI(
+        model_name=config.VERTEX_MODEL,
+        temperature=0.0,
+        max_output_tokens=256,
+        top_p=0.95,
+        credentials=google_credentials,
+        project_id=config.GCP_PROJECT_ID
     )
-    logging.info(f"Vertex AI LangchainAgent initialized successfully with model '{config.VERTEX_MODEL}'.")
+    tools = [find_available_slots, book_appointment]
+    
+    # This is the core agent "brain"
+    agent = create_tool_calling_agent(llm, tools, prompt)
+
+    # This executor wraps the agent and handles tool execution
+    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+    # This adds memory to the agent
+    agent_with_chat_history = RunnableWithMessageHistory(
+        agent_executor,
+        get_session_history,
+        input_messages_key="input",
+        history_messages_key="chat_history",
+    )
+    
+    logging.info(f"Vertex AI Langchain AgentExecutor initialized successfully with model '{config.VERTEX_MODEL}'.")
 except Exception as e:
     logging.error(f"Failed to initialize LLM Agent: {e}", exc_info=True)
     # Depending on the severity, you might want to exit
@@ -287,36 +282,23 @@ async def handle_agent_response(transcript: str, call_sid: str, stream_sid: str,
     async def agent_task():
         logging.info(f"Querying agent for call {call_sid} with: '{transcript}'")
         try:
-            # Use the global agent instance
+            # Use the new agent_with_chat_history
             logging.info(f"starting Querying agent for call {call_sid}")
-            agent_response = await asyncio.to_thread(
-                agent.query,
-                input=transcript,
+            agent_response = await agent_with_chat_history.ainvoke(
+                {"input": transcript},
                 config={"configurable": {"session_id": call_sid}},
             )
             logging.info(f"Agent response for call {call_sid}: {agent_response}")
 
-            # The agent may return a list on error. If so, handle it as a failure.
-            if isinstance(agent_response, list):
-                logging.error(f"Agent returned a list, treating as error. Payload: {agent_response}")
-                raise AttributeError(f"Agent returned a list: {agent_response}")
+            # The new agent structure returns a dictionary, often with an 'output' key
+            if isinstance(agent_response, dict) and "output" in agent_response:
+                tts_text = agent_response["output"]
+            else:
+                # Fallback for unexpected structures
+                tts_text = _to_text(agent_response)
 
-            tts_text = _to_text(agent_response)
             logging.info(f"Normalized agent response to text: '{tts_text}'")
-            if not tts_text or not tts_text.strip():
-                # Try a few more common fields/paths defensively
-                fallback = None
-                if isinstance(agent_response, dict):
-                    fallback = agent_response.get("output") or agent_response.get("text")
-                if not fallback:
-                    fallback = str(agent_response)
-                tts_text = _to_text(fallback)
-        except AttributeError as e:
-            # Common when underlying Google client returns a list payload on error
-            logging.error(f"AttributeError during agent response (likely malformed error payload): {e}")
-            tts_text = (
-                "I'm sorry, I had trouble processing that. Could you please repeat, or let me know if you'd like to book a property visit?"
-            )
+
         except Exception as e:
             logging.error(f"Error in agent task for call {call_sid}: {e}", exc_info=True)
             tts_text = (
@@ -509,7 +491,7 @@ async def websocket_endpoint(websocket: WebSocket, name: str = "z", call_type: s
     query_params = QueryParams(websocket.scope["query_string"].decode())
     # query_params = dict(websocket.query_params)
     logging.info(f"WebSocket query parameters: {query_params}")
-    call_type = query_params.get("type", "INBOUND")
+    call_type = query_params.get("call_type", "INBOUND")
     if call_type == "OUTBOUND":
         name = query_params.get("name", "y")
 
