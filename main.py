@@ -1,64 +1,35 @@
 import asyncio
-from queue import Queue # Use standard queue for thread-safe operations
-import os
 import base64
-import json
 import csv
-from fastapi.responses import JSONResponse, RedirectResponse
 import io
+import json
 import logging
+import os
 import warnings
-from urllib.parse import urlparse
-import websockets
+from typing import Any, Dict, Optional
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Tame noisy third-party warnings in runtime logs
-warnings.filterwarnings(
-    "ignore",
-    category=UserWarning,
-    module=r"vertexai\.generative_models\._generative_models",
-)
-warnings.filterwarnings(
-    "ignore",
-    category=SyntaxWarning,
-    module=r"langchain\.agents\.json_chat\.base",
-)
-
-import pytz
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Request
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
-from twilio.twiml.voice_response import VoiceResponse, Connect
-from twilio.rest import Client as TwilioClient
-import uvicorn
-import datetime
-from google_auth_oauthlib.flow import Flow
-
-# --- LangChain & Vertex AI Imports ---
-from langchain_google_vertexai import ChatVertexAI
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain_core.chat_history import InMemoryChatMessageHistory
-from langchain_core.runnables.history import RunnableWithMessageHistory
-import vertexai
-
-# --- Google Cloud Service Imports ---
-from google.cloud import speech
-from google.cloud import texttospeech
-from google.cloud import secretmanager
 import requests
+import uvicorn
+from fastapi import FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, RedirectResponse, Response
+from google_auth_oauthlib.flow import Flow
+from google.cloud import secretmanager
+from twilio.rest import Client as TwilioClient
+from twilio.twiml.voice_response import Connect, Stream, VoiceResponse
 
-# --- Local Application Imports ---
 import config
-from prompts import prompt
-from google_calendar import find_available_slots, book_appointment
+from realtime.call_flow import CallFlowManager
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=SyntaxWarning)
 
 
 # --- Initialization ---
 app = FastAPI()
 
+# --- Middleware ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -67,443 +38,91 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Google Cloud & Vertex AI Init ---
-# Centralized credentials from config.py
-google_credentials = config.GOOGLE_CREDENTIALS 
-
-if not config.GCP_PROJECT_ID:
-    logging.error("GCP_PROJECT_ID is not set. Please check your .env file or environment variables.")
-else:
-    try:
-        vertexai.init(project=config.GCP_PROJECT_ID, location=config.GCP_LOCATION, credentials=google_credentials)
-        logging.info(f"Vertex AI initialized for project '{config.GCP_PROJECT_ID}' in location '{config.GCP_LOCATION}'.")
-    except Exception as e:
-        logging.error(f"Failed to initialize Vertex AI: {e}")
-
-# --- Service Clients ---
+# --- Global State ---
 twilio_client = TwilioClient(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
-speech_client = speech.SpeechClient(credentials=google_credentials)
-tts_client = texttospeech.TextToSpeechClient(credentials=google_credentials)
+active_call_flows: Dict[str, CallFlowManager] = {}
+secret_manager_client = secretmanager.SecretManagerServiceClient()
 
-logging.info("Service clients initialized.")
-
-# --- LangChain Agent Setup ---
-# A dictionary to store chat histories. In a production environment,
-# you would use a more persistent storage solution.
-session_histories = {}
-
-def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
-    """
-    Retrieves a chat history for a given session ID, creating a new one if it
-    doesn't exist.
-    """
-    if session_id not in session_histories:
-        session_histories[session_id] = InMemoryChatMessageHistory()
-    return session_histories[session_id]
-
-try:
-    if not config.GCP_PROJECT_ID:
-        raise RuntimeError("Missing GCP_PROJECT_ID; cannot create LangchainAgent.")
-    
-    # New, more robust agent setup
-    llm = ChatVertexAI(
-        model_name=config.VERTEX_MODEL,
-        temperature=0.0,
-        max_output_tokens=256,
-        top_p=0.95,
-        credentials=google_credentials,
-        project_id=config.GCP_PROJECT_ID
-    )
-    tools = [find_available_slots, book_appointment]
-    
-    # This is the core agent "brain"
-    agent = create_tool_calling_agent(llm, tools, prompt)
-
-    # This executor wraps the agent and handles tool execution
-    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
-
-    # This adds memory to the agent
-    agent_with_chat_history = RunnableWithMessageHistory(
-        agent_executor,
-        get_session_history,
-        input_messages_key="input",
-        history_messages_key="chat_history",
-    )
-    
-    logging.info(f"Vertex AI Langchain AgentExecutor initialized successfully with model '{config.VERTEX_MODEL}'.")
-except Exception as e:
-    logging.error(f"Failed to initialize LLM Agent: {e}", exc_info=True)
-    # Depending on the severity, you might want to exit
-    # raise SystemExit(1) from e
+# --- Application Lifecycle Events ---
+@app.on_event("shutdown")
+async def on_shutdown():
+    """Gracefully stop all active call flows on server shutdown."""
+    logging.info("Server is shutting down. Cleaning up active calls...")
+    # Create a list of tasks to await
+    cleanup_tasks = [
+        call_flow.stop() for call_flow in active_call_flows.values()
+    ]
+    # Wait for all stop methods to complete
+    await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+    active_call_flows.clear()
+    logging.info("All active calls have been cleaned up.")
 
 
-
-def _to_text(content) -> str:
-    """Normalize agent/LLM content to plain string for TTS.
-
-    Tries common shapes returned by Vertex AI + LangChain across versions:
-    - Plain string
-    - Objects with .text / .output_text / .content
-    - Dicts with keys like ["output", "text", "content", "result", "message"]
-    - Lists of the above (flattens recursively)
-    Never raises on unexpected shapes; always returns a best-effort string.
-    """
-    try:
-        logging.info(f"Normalizing content to text: {content} (type: {type(content)})")
-        if content is None:
-            return ""
-
-        # Handle lists first, as they are a common error format from Vertex
-        if isinstance(content, list):
-            parts = [
-                _to_text(part)
-                for part in content
-                if part is not None and _to_text(part) is not None
-            ]
-            # Filter out empties while preserving spacing
-            return " ".join(p for p in parts if p)
-
-        # Common simple cases
-        if isinstance(content, str):
-            return content
-
-        # Vertex / LangChain objects often expose .text or .output_text
-        for attr in ("text", "output_text"):
-            if hasattr(content, attr):
-                try:
-                    val = getattr(content, attr)
-                    return val if isinstance(val, str) else _to_text(val)
-                except Exception:
-                    pass
-
-        # Some responses expose a .content attribute which may itself be a list or nested object
-        if hasattr(content, "content"):
-            try:
-                return _to_text(getattr(content, "content"))
-            except Exception:
-                pass
-
-        # Dict-like structures: check a few likely fields
-        if isinstance(content, dict):
-            for key in ("output", "text", "content", "result", "message", "response"):
-                if key in content and content[key]:
-                    return _to_text(content[key])
-            # Some Vertex responses contain "candidates" -> [ {"content": ...} ]
-            candidates = content.get("candidates") if "candidates" in content else None
-            if candidates:
-                return _to_text(candidates)
-            # Fallback to stringifying the dict
-            return str(content)
-
-        # Anything else: best-effort string
-        return str(content)
-    except Exception:
-        # Absolute fallback: never propagate parsing errors to the call site
-        try:
-            return str(content)
-        except Exception:
-            return ""
-
-# --- Healthcheck & Root ---
+# ---------------------------------------------------------------------------
+# Healthcheck endpoints
+# ---------------------------------------------------------------------------
 @app.get("/")
 async def root_healthcheck():
-    """Simple healthcheck endpoint for Render and uptime monitors."""
-    return JSONResponse({"status": "ok"})
+    """Basic health check to confirm the server is running."""
+    return {"status": "ok"}
 
 
-# --- Real-time Transcription & Agent Logic ---
-
-async def send_clear_message(websocket: WebSocket, stream_sid: str):
-    """Sends a clear message to Twilio to stop any queued audio."""
-    try:
-        clear_message = {
-            "event": "clear",
-            "streamSid": stream_sid,
-        }
-        await websocket.send_text(json.dumps(clear_message))
-        logging.info(f"Sent clear message to Twilio for stream {stream_sid}")
-    except WebSocketDisconnect:
-        logging.warning(f"Failed to send clear message: WebSocket for stream {stream_sid} is disconnected.")
-    except Exception as e:
-        logging.error(f"Error sending clear message for stream {stream_sid}: {e}")
-
-async def generate_and_stream_audio(text: str, websocket: WebSocket, stream_sid: str, interruption_event: asyncio.Event):
-    """Generates audio using Google TTS and streams it to Twilio, checking for interruptions."""
-    if not text or not text.strip():
-        logging.warning("TTS text is empty; skipping audio generation.")
-        return False
-
-    logging.info(f"Generating audio for stream {stream_sid}: '{text}'")
-    try:
-        synthesis_input = texttospeech.SynthesisInput(text=text)
-        voice = texttospeech.VoiceSelectionParams(
-            language_code="en-US",
-            name="Charon",  # Example voice, adjust as needed
-            model_name="gemini-2.5-pro-tts"
-        )
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.MULAW,
-            sample_rate_hertz=8000
-        )
-
-        response = await asyncio.to_thread(
-            tts_client.synthesize_speech,
-            input=synthesis_input, voice=voice, audio_config=audio_config
-        )
-
-        # Send audio in chunks to allow for interruption
-        chunk_size = 1600 # 100ms of 8kHz 8-bit audio
-        for i in range(0, len(response.audio_content), chunk_size):
-            if interruption_event.is_set():
-                logging.info(f"Interruption detected. Stopping audio stream {stream_sid}.")
-                return True # Interrupted
-
-            chunk = response.audio_content[i:i + chunk_size]
-            encoded_chunk = base64.b64encode(chunk).decode('utf-8')
-            media_message = {
-                "event": "media",
-                "streamSid": stream_sid,
-                "media": {"payload": encoded_chunk}
-            }
-            await websocket.send_text(json.dumps(media_message))
-            # Small sleep to allow interruption event to be processed
-            await asyncio.sleep(0.05)
-
-        logging.info(f"Finished streaming audio for stream {stream_sid}")
-        return False # Not interrupted
-
-    except Exception as e:
-        logging.error(f"Error generating or streaming audio for stream {stream_sid}: {e}", exc_info=True)
-        return False
-
-async def handle_agent_response(transcript: str, call_sid: str, stream_sid: str, websocket: WebSocket):
-    """Gets response from LLM, synthesizes audio, and streams it back to Twilio."""
-    interruption_event = asyncio.Event()
-
-    # The agent task will run in the background
-    async def agent_task():
-        logging.info(f"Querying agent for call {call_sid} with: '{transcript}'")
-        tts_text = ""
-        try:
-            # Use the streaming version of the agent
-            logging.info(f"Starting agent stream for call {call_sid}")
-            
-            full_response_parts = []
-            async for chunk in agent_with_chat_history.astream(
-                {"input": transcript},
-                config={"configurable": {"session_id": call_sid}},
-            ):
-                # The chunk is a dictionary. We are interested in the 'output' key from 'agent' steps
-                # or the final 'output' from the last step.
-                if "agent" in chunk and "output" in chunk["agent"]:
-                    # This is an intermediate step from the agent with a text response
-                    part = chunk["agent"]["output"]
-                    full_response_parts.append(part)
-                elif "output" in chunk:
-                    # This is the final output
-                    part = chunk["output"]
-                    full_response_parts.append(part)
-
-            tts_text = "".join(full_response_parts)
-            logging.info(f"Final assembled agent response for call {call_sid}: {tts_text}")
-
-        except Exception as e:
-            logging.error(f"Error in agent task for call {call_sid}: {e}", exc_info=True)
-            tts_text = (
-                "I ran into a technical issue. Could you restate that, or tell me a good time you'd like to visit a property?"
-            )
-
-        logging.info(f"Agent for call {call_sid} says: {tts_text}")
-
-        was_interrupted = await generate_and_stream_audio(tts_text, websocket, stream_sid, interruption_event)
-
-        if was_interrupted:
-            await send_clear_message(websocket, stream_sid)
-            logging.info(f"Agent speech for {call_sid} was interrupted.")
-
-    # Return the task and the interruption event so the main loop can manage it
-    return asyncio.create_task(agent_task()), interruption_event
-
-def get_stt_config():
-    """Returns the Google STT streaming configuration for Twilio."""
-    return speech.StreamingRecognitionConfig(
-        config=speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
-            sample_rate_hertz=8000,
-            language_code="en-US",
-            model="telephony",
-            use_enhanced=True,
-            enable_automatic_punctuation=True,
-        ),
-        single_utterance=True, # Critical for turn-based conversation
-        interim_results=False,
-    )
-
-async def transcription_agent_task(websocket: WebSocket, call_sid: str, stream_sid: str, lead_name: str | None = None):
-    """Handles the full lifecycle of a voice call using Google STT/TTS with interruption."""
-    logging.info(f"Starting agent task for call {call_sid}, stream {stream_sid}, name: {lead_name}")
-    
-    main_loop = asyncio.get_running_loop()
-    audio_queue = Queue()
-    stop_event = asyncio.Event()
-    active_agent_task = None
-    interruption_event = None
-
-    # --- Audio Receiver (Async) ---
-    async def audio_receiver():
-        """Receives audio from Twilio and puts it into a standard queue."""
-        logging.info(f"Audio receiver started for {call_sid}")
-        try:
-            while not stop_event.is_set():
-                message_str = await websocket.receive_text()
-                data = json.loads(message_str)
-                event = data.get("event")
-
-                if event == "media":
-                    payload = data["media"]["payload"]
-                    audio_queue.put(base64.b64decode(payload))
-                elif event == "start":
-                     # This is handled in the main websocket_endpoint now
-                    pass
-                elif event == "stop":
-                    logging.info(f"Twilio 'stop' event received for call {call_sid}")
-                    stop_event.set()
-                    break
-        except WebSocketDisconnect:
-            logging.warning(f"Twilio WebSocket disconnected for call {call_sid}")
-        except Exception as e:
-            logging.error(f"Error in audio_receiver for {call_sid}: {e}")
-        finally:
-            audio_queue.put(None) # Signal the end of audio
-            logging.info(f"Audio receiver stopped for {call_sid}")
-
-    # --- STT Worker (Sync, runs in a separate thread) ---
-    def stt_worker(loop):
-        """Processes audio from the queue using Google STT in a blocking manner."""
-        
-        def audio_generator():
-            """Yields audio chunks from the queue for the STT client."""
-            while not stop_event.is_set():
-                chunk = audio_queue.get()
-                if chunk is None:
-                    return
-                yield speech.StreamingRecognizeRequest(audio_content=chunk)
-                audio_queue.task_done()
-
-        try:
-            stt_config = get_stt_config()
-            responses = speech_client.streaming_recognize(
-                config=stt_config,
-                requests=audio_generator(),
-            )
-
-            for response in responses:
-                if not response.results:
-                    continue
-                result = response.results[0]
-                if not result.alternatives:
-                    continue
-                
-                transcript = result.alternatives[0].transcript.strip()
-
-                if result.is_final and transcript:
-                    logging.info(f"Final transcript for {call_sid}: '{transcript}'")
-                    # Since this is a sync function, we need to run the async handler
-                    # in the main event loop.
-                    asyncio.run_coroutine_threadsafe(
-                        handle_final_transcript(transcript),
-                        loop
-                    )
-                    # Because single_utterance=True, the stream will close here.
-                    # We break to allow the worker to exit and be restarted for the next turn.
-                    break 
-
-        except Exception as e:
-            if "DEADLINE_EXCEEDED" in str(e):
-                logging.warning(f"STT stream deadline exceeded for {call_sid}. This is expected on silence.")
-            else:
-                logging.error(f"STT worker error for {call_sid}: {e}", exc_info=True)
-        finally:
-            logging.info(f"STT worker finished for {call_sid}.")
-            # Do not set stop_event here, let the main loop control it
-
-    # --- Final Transcript Handler (Async) ---
-    async def handle_final_transcript(transcript: str):
-        """Handles the logic for when a final transcript is received."""
-        nonlocal active_agent_task, interruption_event
-        try:
-            # If an agent is currently speaking, interrupt it.
-            if active_agent_task and interruption_event and not interruption_event.is_set():
-                logging.info(f"User interrupted. Setting interruption event for {call_sid}.")
-                interruption_event.set()
-                await active_agent_task  # Wait for the interrupted task to clean up
-
-            # Start a new agent response task
-            active_agent_task, interruption_event = await handle_agent_response(
-                transcript, call_sid, stream_sid, websocket
-            )
-        except Exception as e:
-            logging.error(f"Error handling final transcript for {call_sid}: {e}", exc_info=True)
+@app.get("/health")
+async def health():
+    """Detailed health check."""
+    return {"status": "healthy"}
 
 
-    # --- Main Task Logic ---
-    receiver_task = asyncio.create_task(audio_receiver())
-
-    try:
-        # 1. Greet the user
-        greeting_text = f"Hi, am I speaking with {lead_name}?"
-        interruption_event = asyncio.Event() # Initial event for the greeting
-        await generate_and_stream_audio(greeting_text, websocket, stream_sid, interruption_event)
-
-        # 2. Start the STT worker loop
-        while not stop_event.is_set():
-            # Run the synchronous STT worker in a background thread
-            await asyncio.to_thread(stt_worker, main_loop)
-            # After stt_worker finishes (due to single_utterance), it will loop
-            # and start a new recognition stream, unless the stop_event is set.
-            if stop_event.is_set():
-                break
-            # Small sleep to prevent tight looping if something goes wrong
-            await asyncio.sleep(0.1)
-
-    except Exception as e:
-        logging.error(f"Error in transcription_agent_task for {call_sid}: {e}", exc_info=True)
-    finally:
-        stop_event.set()
-        if receiver_task:
-            await receiver_task
-        if active_agent_task:
-            await active_agent_task
-        logging.info(f"Agent task finished for call {call_sid}.")
-
-
-# --- FastAPI Endpoints ---
+# ---------------------------------------------------------------------------
+# Twilio call handling (Gemini Live)
+# ---------------------------------------------------------------------------
 @app.post("/inbound_call")
-async def handle_inbound_call():
+async def handle_inbound_call(request: Request):
+    """
+    Handles inbound calls from Twilio.
+    This endpoint generates TwiML to connect the call to our WebSocket server.
+    """
     logging.info("Inbound call received")
+    
+    # Determine WebSocket URL dynamically from the request headers
+    host = request.headers.get("host", "localhost")
+    # Use wss for secure WebSockets, which is required by Twilio
+    websocket_url = f"wss://{host}/ws?call_type=INBOUND"
+    
     response = VoiceResponse()
     connect = Connect()
-    # Ensure the websocket URL is correct for your deployment
-    connect.stream(url=f"wss://realestate-voiceai-receptionist.onrender.com/ws?call_type=INBOUND")
+    connect.stream(url=websocket_url)
     response.append(connect)
+    
+    logging.info(f"Generated TwiML for inbound call: {str(response)}")
     return Response(content=str(response), media_type="application/xml")
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    """Handles the WebSocket connection from Twilio."""
+async def websocket_endpoint(
+    websocket: WebSocket,
+    name: str = "Valued Customer",
+    call_type: str = "INBOUND"
+):
+    """
+    Handles the bidirectional audio stream with Twilio via WebSocket.
+    - Receives audio from Twilio.
+    - Forwards audio to the Gemini Live API.
+    - Receives audio from Gemini.
+    - Forwards audio back to Twilio.
+    """
     await websocket.accept()
-    
-    # Manually parse query parameters from the WebSocket URL
-    query_params = dict(websocket.query_params)
-    name = query_params.get("name", "Valued Customer")
-    call_type = query_params.get("call_type", "INBOUND")
-
     logging.info(f"WebSocket connection accepted. Lead name: {name}, Type: {call_type}")
+    
     call_sid = "Unknown"
     stream_sid = "Unknown"
-    
+    call_flow: Optional[CallFlowManager] = None
+
+    async def twilio_ws_send(message: Dict[str, Any]):
+        """Helper to send a JSON message to the Twilio WebSocket."""
+        await websocket.send_text(json.dumps(message))
+
     try:
-        # First message is 'connected'
+        # The first message from Twilio is a 'connected' event.
         connected_message = await websocket.receive_text()
         connected_data = json.loads(connected_message)
         event = connected_data.get("event")
@@ -515,57 +134,85 @@ async def websocket_endpoint(websocket: WebSocket):
         
         logging.info(f"Twilio 'connected' event received. Protocol: {connected_data.get('protocol')}, Version: {connected_data.get('version')}")
 
-        # The second message from Twilio should be a 'start' event
+        # The second message from Twilio is a 'start' event, containing call details.
         start_message = await websocket.receive_text()
         start_data = json.loads(start_message)
         event = start_data.get("event")
 
         if event != "start":
-            logging.error(f"Received unexpected event '{event}' before 'start'.")
+            logging.error(f"Received unexpected event '{event}' before 'start'. Closing connection.")
             await websocket.close()
             return
 
         # Extract call and stream SIDs from the start message
         call_sid = start_data.get("start", {}).get("callSid", "Unknown")
         stream_sid = start_data.get("streamSid", "Unknown")
-        logging.info(f"Twilio 'start' event received for call {call_sid}, stream {stream_sid}")
+        logging.info("Twilio stream started: call=%s stream=%s type=%s", call_sid, stream_sid, call_type)
 
-        # Start the main transcription and agent processing task
-        await transcription_agent_task(websocket, call_sid, stream_sid, name)
+        # Initialize and start the call flow manager
+        call_flow = CallFlowManager(
+            call_sid=call_sid,
+            stream_sid=stream_sid,
+            twilio_ws_send_callback=twilio_ws_send,
+        )
+        active_call_flows[stream_sid] = call_flow
+        await call_flow.start()
+
+        # Main loop to process incoming messages from Twilio
+        while True:
+            message_str = await websocket.receive_text()
+            payload = json.loads(message_str)
+            event = payload.get("event")
+
+            if event == "media" and call_flow:
+                # Forward audio chunks to the call flow manager
+                audio_bytes = base64.b64decode(payload["media"]["payload"])
+                await call_flow.handle_audio_from_twilio(audio_bytes)
+            elif event == "stop":
+                # Twilio signals that the stream has ended
+                logging.info("Twilio stop event received for stream %s.", stream_sid)
+                break
 
     except WebSocketDisconnect:
-        logging.info(f"WebSocket connection closed for call SID: {call_sid}")
+        logging.info(f"WebSocket connection closed by client for call SID: {call_sid}")
     except Exception as e:
         logging.error(f"Error in WebSocket endpoint for call {call_sid}: {e}", exc_info=True)
     finally:
-        logging.info(f"WebSocket endpoint closing for call SID: {call_sid}.")
-        if call_sid in session_histories:
-            del session_histories[call_sid]
-            logging.info(f"Cleaned up chat history for call {call_sid}.")
+        # Cleanup resources
+        if call_flow:
+            await call_flow.stop()
+        active_call_flows.pop(stream_sid, None)
+        logging.info("Cleaned up resources for stream %s", stream_sid)
 
 
 # --- Google Calendar OAuth 2.0 Endpoints ---
 
 # NOTE: In a production environment, the REDIRECT_URI must be a public URL
 # that you have registered in your Google Cloud Console for the OAuth client.
-# For local testing, you can use a tool like ngrok to expose your localhost.
-CLIENT_SECRETS_FILE = os.getenv("GOOGLE_OAUTH_WEB_CLIENT_SECRETS") #"credentials.json"
-credentials_info = json.loads(CLIENT_SECRETS_FILE)
+try:
+    CLIENT_SECRETS_FILE = os.getenv("GOOGLE_OAUTH_WEB_CLIENT_SECRETS")
+    if not CLIENT_SECRETS_FILE:
+        raise ValueError("GOOGLE_OAUTH_WEB_CLIENT_SECRETS env var not set.")
+    credentials_info = json.loads(CLIENT_SECRETS_FILE)
+except (ValueError, json.JSONDecodeError) as e:
+    logging.error(f"Error loading Google OAuth client secrets: {e}. Please check the environment variable.")
+    credentials_info = None
+
 # The redirect URI must match *exactly* one of the authorized redirect URIs
 # for the OAuth 2.0 client, which you configure in the Google Cloud console.
-REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://realestate-voiceai-receptionist.onrender.com/oauth2callback")
+REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "https://realestate-voiceai-receptionist.onrender.com/oauth2callback")
 
 
-# CLIENT URL
 @app.get("/auth", tags=["Google Calendar Auth"])
 def auth(request: Request):
     """
     Generates the Google OAuth 2.0 authorization URL.
     Redirect the user to this URL to start the consent process.
     """
+    if not credentials_info:
+        return JSONResponse(status_code=500, content={"message": "OAuth client is not configured."})
+
     # The state parameter is used to prevent CSRF attacks.
-    # You can use it to store session-specific information.
-    # Here we use the client's host as a simple state.
     state = request.client.host
     flow = Flow.from_client_config(
         credentials_info,
@@ -575,10 +222,9 @@ def auth(request: Request):
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
-        # You can pass the state here if you need to
-        # state=state
+        # state=state # Optional: for CSRF protection
     )
-    logging.info(f"Generated OAuth URL for {request.client.host}, redirecting...- {auth_url}")
+    logging.info(f"Generated OAuth URL for {state}, redirecting to: {auth_url}")
     return RedirectResponse(auth_url)
 
 
@@ -586,15 +232,19 @@ def auth(request: Request):
 async def oauth2callback(request: Request):
     """
     Handles the callback from Google after the user grants consent.
-    Fetches the OAuth 2.0 token and saves it for the client.
+    Fetches the OAuth 2.0 token and securely stores it in Google Secret Manager.
     """
+    if not credentials_info:
+        return JSONResponse(status_code=500, content={"message": "OAuth client is not configured."})
+
     # The full URL of the request is required to fetch the token.
     authorization_response = str(request.url)
     
     # For security, ensure the response is sent over HTTPS in production
     if "http://" in authorization_response and "localhost" not in authorization_response:
         logging.warning("OAuth callback received over HTTP. In production, this should be HTTPS.")
-        # In a production environment, you might want to enforce HTTPS:
+        # To enforce HTTPS, uncomment the following lines:
+        # from fastapi import HTTPException
         # raise HTTPException(status_code=400, detail="OAuth callback must be over HTTPS")
 
     flow = Flow.from_client_config(
@@ -610,20 +260,16 @@ async def oauth2callback(request: Request):
         return JSONResponse(status_code=400, content={"message": "Failed to fetch OAuth token."})
 
     credentials = flow.credentials
-
-    logging.info(f"OAuth token fetched successfully for client - {credentials}")
+    logging.info("OAuth token fetched successfully.")
 
     # --- Securely Store Client Credentials in Google Secret Manager ---
     try:
-        # Initialize Secret Manager client
-        secret_client = secretmanager.SecretManagerServiceClient(credentials=google_credentials)
-        
-        # Use the user's email as a unique identifier.
-        # First, get the user's info using the access token.
+        # Get the user's email to use as a unique identifier for the secret.
         userinfo_response = requests.get(
             "https://www.googleapis.com/oauth2/v3/userinfo",
             headers={"Authorization": f"Bearer {credentials.token}"}
         )
+        userinfo_response.raise_for_status()
         userinfo = userinfo_response.json()
         client_email = userinfo.get("email")
 
@@ -637,7 +283,6 @@ async def oauth2callback(request: Request):
         # (Secret IDs can only contain letters, numbers, hyphens, and underscores)
         secret_id = f"oauth-token-{client_email.replace('@', '-').replace('.', '-')}"
         
-        # The parent project for the secret
         parent = f"projects/{config.GCP_PROJECT_ID}"
         secret_name = f"{parent}/secrets/{secret_id}"
 
@@ -653,12 +298,12 @@ async def oauth2callback(request: Request):
 
         # Check if the secret exists. If not, create it.
         try:
-            logging.info(f"Checking if secret exists -  '{secret_name}' ")
-            secret_client.get_secret(request={"name": secret_name})
+            logging.info(f"Checking if secret '{secret_id}' exists.")
+            secret_manager_client.get_secret(request={"name": secret_name})
             logging.info(f"Secret '{secret_id}' already exists. Adding a new version.")
-        except Exception as e: # google.api_core.exceptions.NotFound
+        except Exception: # google.api_core.exceptions.NotFound
             logging.info(f"Secret '{secret_id}' not found. Creating it now.")
-            secret_client.create_secret(
+            secret_manager_client.create_secret(
                 request={
                     "parent": parent,
                     "secret_id": secret_id,
@@ -667,12 +312,15 @@ async def oauth2callback(request: Request):
             )
         
         # Add the token data as a new version of the secret
-        secret_client.add_secret_version(
+        secret_manager_client.add_secret_version(
             request={"parent": secret_name, "payload": {"data": payload}}
         )
         
-        logging.info(f"Successfully saved token for client '{client_email}' to Secret Manager as '{secret_id}'")
+        logging.info(f"Successfully saved token for '{client_email}' to Secret Manager as '{secret_id}'")
 
+    except requests.HTTPError as http_err:
+        logging.error(f"HTTP error while fetching user info: {http_err}", exc_info=True)
+        return JSONResponse(status_code=500, content={"message": "Failed to fetch user info from Google."})
     except Exception as e:
         logging.error(f"Failed to save token to Secret Manager: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"message": "Failed to save token to Secret Manager."})
@@ -681,58 +329,91 @@ async def oauth2callback(request: Request):
 
 # --- Outbound Campaign Management ---
 outbound_leads_queue = asyncio.Queue()
-campaign_in_progress = False
+campaign_in_progress = asyncio.Event()
 
-async def campaign_worker():
-    global campaign_in_progress
-    campaign_in_progress = True
+async def campaign_worker(server_host: str):
+    """Processes leads from the queue and initiates outbound calls."""
     logging.info("Starting outbound campaign worker...")
+    campaign_in_progress.set()
+    
     while not outbound_leads_queue.empty():
         lead = await outbound_leads_queue.get()
-        logging.info(f"Processing lead: {lead['first_name']} {lead['last_name']} at {lead['phone']}")
+        first_name = lead.get('first_name', '').strip()
+        phone_number = lead.get('phone', '').strip()
+        
+        if not phone_number:
+            logging.warning(f"Skipping lead with missing phone number: {lead}")
+            outbound_leads_queue.task_done()
+            continue
+            
+        logging.info(f"Processing lead: {first_name} at {phone_number}")
         try:
-            # Note: Update wss URL to your deployed server's URL
-            websocket_url = f"wss://realestate-voiceai-receptionist.onrender.com/ws?name={lead['first_name']}&call_type=OUTBOUND"
-            twiml_response = VoiceResponse()
+            # Use the dynamically determined server host for the WebSocket URL
+            websocket_url = f"wss://{server_host}/ws?name={first_name}&call_type=OUTBOUND"
+            
+            twiml = VoiceResponse()
             connect = Connect()
             connect.stream(url=websocket_url)
-            twiml_response.append(connect)
-            logging.info(f"Initiating outbound call to {lead['phone']} with TwiML: {str(twiml_response)}")
-            call = twilio_client.calls.create(to=lead['phone'], from_=config.TWILIO_PHONE_NUMBER, twiml=str(twiml_response))
-            logging.info(f"Outbound call initiated to {lead['phone']}, SID: {call.sid}")
-            await asyncio.sleep(15) # Wait before processing the next lead
+            twiml.append(connect)
+            
+            logging.info(f"Initiating outbound call to {phone_number} with TwiML: {str(twiml)}")
+            
+            call = twilio_client.calls.create(
+                to=phone_number,
+                from_=config.TWILIO_PHONE_NUMBER,
+                twiml=str(twiml)
+            )
+            logging.info(f"Outbound call initiated to {phone_number}, SID: {call.sid}")
+            
+            # Wait for a configurable duration before processing the next lead
+            await asyncio.sleep(config.OUTBOUND_CALL_INTERVAL_SECONDS)
+            
         except Exception as e:
-            logging.error(f"Failed to call lead {lead['first_name']}: {e}", exc_info=True)
-        outbound_leads_queue.task_done()
+            logging.error(f"Failed to call lead {first_name} at {phone_number}: {e}", exc_info=True)
+        finally:
+            outbound_leads_queue.task_done()
+            
     logging.info("Outbound campaign finished.")
-    campaign_in_progress = False
+    campaign_in_progress.clear()
 
 @app.post("/start_outbound_campaign")
-async def start_outbound_campaign(file: UploadFile = File(...)):
-    global campaign_in_progress
-    if campaign_in_progress:
-        return {"status": "error", "message": "A campaign is already in progress."}
+async def start_outbound_campaign(request: Request, file: UploadFile = File(...)):
+    """
+    Starts an outbound calling campaign from a CSV file of leads.
+    The CSV should have 'first_name' and 'phone' columns.
+    """
+    if campaign_in_progress.is_set():
+        return JSONResponse(status_code=409, content={"status": "error", "message": "A campaign is already in progress."})
+        
     logging.info("Received request to start outbound campaign.")
+    
     try:
-        # Reaading file content from csv
+        # Read and parse the uploaded CSV file
         content = await file.read()
-        file_data = io.StringIO(content.decode("utf-8"))
+        file_data = io.StringIO(content.decode("utf-8-sig")) # Use utf-8-sig to handle potential BOM
         reader = csv.DictReader(file_data)
-        leads_loaded = 0
-        for row in reader:
-            await outbound_leads_queue.put(row)
-            leads_loaded += 1
-        if leads_loaded > 0:
-            asyncio.create_task(campaign_worker())
-            message = f"Campaign started with {leads_loaded} leads."
-        else:
-            message = "No leads found in the uploaded file."
+        
+        leads = list(reader)
+        if not leads:
+            return JSONResponse(status_code=400, content={"status": "error", "message": "No leads found in the uploaded file."})
+
+        for lead in leads:
+            await outbound_leads_queue.put(lead)
+            
+        # Get the server host to construct the WebSocket URL
+        server_host = request.headers.get("host", "localhost")
+        
+        # Start the campaign worker in the background
+        asyncio.create_task(campaign_worker(server_host))
+        
+        message = f"Campaign started with {len(leads)} leads."
         logging.info(message)
         return {"status": "success", "message": message}
+        
     except Exception as e:
-        logging.error(f"Failed to process uploaded file: {e}", exc_info=True)
-        return {"status": "error", "message": "Failed to process file."}
+        logging.error(f"Failed to process uploaded file or start campaign: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"status": "error", "message": "Failed to process file."})
 
 if __name__ == "__main__":
-    logging.info("Starting server with uvicorn")
+    logging.info("Starting FastAPI server with uvicorn.")
     uvicorn.run(app, host="0.0.0.0", port=8000)

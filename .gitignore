@@ -38,6 +38,7 @@ MANIFEST
 
 
 credentials.json
+client_secret.json
 
 # Virtual Environment
 venv/

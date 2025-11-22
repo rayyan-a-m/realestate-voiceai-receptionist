@@ -3,11 +3,13 @@ import datetime
 import pytz
 import logging
 import json
+from typing import Optional
+
 from langchain_core.tools import tool
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
+from googleapiclient.discovery import build, Resource
+from google.api_core.exceptions import NotFound
 from google.cloud import secretmanager
 
 import config
@@ -21,8 +23,11 @@ SCOPES = ["https://www.googleapis.com/auth/calendar"]
 # The ID of the secret in Google Secret Manager containing the OAuth token JSON.
 OAUTH_TOKEN_SECRET_ID = os.getenv("OAUTH_TOKEN_SECRET_ID")
 
+# --- Caching ---
+_calendar_service: Optional[Resource] = None
 
-def get_property_by_id(property_id: str):
+
+def get_property_by_id(property_id: str) -> Optional[dict]:
     """Helper function to find a property by its ID."""
     for prop in PROPERTIES:
         if prop['id'] == property_id:
@@ -30,58 +35,98 @@ def get_property_by_id(property_id: str):
     return None
 
 
-def get_calendar_service():
-    """
-    Gets an authorized Google Calendar service instance.
-
-    Priority order for credentials:
-    1. Fetches from Google Secret Manager if OAUTH_TOKEN_SECRET_ID is set.
-    2. Reads from a local 'token.json' file.
-    3. Initiates a new OAuth 2.0 flow as a last resort.
-    """
-    creds = None
-
-    # 1. Try to load from Google Secret Manager
-    if OAUTH_TOKEN_SECRET_ID and config.GCP_PROJECT_ID:
-        try:
-            logging.info(f"Attempting to load OAuth token from Secret Manager: '{OAUTH_TOKEN_SECRET_ID}'")
-            client = secretmanager.SecretManagerServiceClient(credentials=config.GOOGLE_CREDENTIALS)
-            secret_name = f"projects/{config.GCP_PROJECT_ID}/secrets/{OAUTH_TOKEN_SECRET_ID}/versions/latest"
-            response = client.access_secret_version(request={"name": secret_name})
-            token_data = json.loads(response.payload.data.decode("UTF-8"))
-            creds = Credentials.from_authorized_user_info(token_data, SCOPES)
-            logging.info("Successfully loaded credentials from Secret Manager.")
-        except Exception as e:
-            logging.error(f"Failed to load token from Secret Manager. Falling back. Error: {e}", exc_info=True)
-
-    # 2. If Secret Manager fails or is not configured, try local token.json
-    if not creds and os.path.exists("token.json"):
-        logging.info("Found token.json, loading credentials from file.")
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-
-    # 3. Refresh or run new OAuth flow if credentials are not valid
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            logging.info("Credentials expired, refreshing token.")
-            creds.refresh(Request())
-        else:
-            logging.info("No valid credentials found, running new OAuth flow.")
-            # This part is for local development and should not run in production
-            if not os.path.exists("credentials.json"):
-                logging.error("FATAL: credentials.json not found. Cannot initiate OAuth flow.")
-                raise FileNotFoundError("credentials.json is required to create a new token.")
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
+def _load_credentials_from_secret_manager() -> Optional[Credentials]:
+    """Loads Google OAuth credentials from Google Secret Manager."""
+    if not OAUTH_TOKEN_SECRET_ID or not config.GCP_PROJECT_ID:
+        logging.info("Secret Manager environment variables not set. Skipping.")
+        return None
+    
+    try:
+        logging.info(f"Attempting to load OAuth token from Secret Manager: '{OAUTH_TOKEN_SECRET_ID}'")
+        client = secretmanager.SecretManagerServiceClient()
+        secret_name = f"projects/{config.GCP_PROJECT_ID}/secrets/{OAUTH_TOKEN_SECRET_ID}/versions/latest"
+        response = client.access_secret_version(request={"name": secret_name})
+        token_data = json.loads(response.payload.data.decode("UTF-8"))
         
-        # Save the new/refreshed credentials to token.json for local cache
-        try:
-            with open("token.json", "w") as token:
-                logging.info("Saving/updating credentials to token.json.")
-                token.write(creds.to_json())
-        except IOError as e:
-            logging.error(f"Could not write to token.json: {e}")
+        creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+        
+        # Refresh the token if it's expired
+        if creds.expired and creds.refresh_token:
+            logging.info("Credentials from Secret Manager are expired. Refreshing...")
+            creds.refresh(Request())
+            # Note: In a complete solution, you might want to save the refreshed token back to Secret Manager.
+            # This is omitted for simplicity but is a key production consideration.
             
-    return build("calendar", "v3", credentials=creds)
+        logging.info("Successfully loaded and validated credentials from Secret Manager.")
+        return creds
+    except NotFound:
+        logging.error(f"Secret '{OAUTH_TOKEN_SECRET_ID}' not found in project '{config.GCP_PROJECT_ID}'.")
+        return None
+    except Exception as e:
+        logging.error(f"Failed to load or refresh token from Secret Manager: {e}", exc_info=True)
+        return None
+
+
+def _load_credentials_from_local_file() -> Optional[Credentials]:
+    """Loads Google OAuth credentials from a local 'token.json' file for development."""
+    if not os.path.exists("token.json"):
+        logging.info("'token.json' not found. Skipping local file credential loading.")
+        return None
+        
+    try:
+        logging.info("Loading credentials from local 'token.json' file.")
+        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+        
+        # Refresh the token if it's expired
+        if creds.expired and creds.refresh_token:
+            logging.info("Local credentials expired. Refreshing token.")
+            creds.refresh(Request())
+            # Save the refreshed credentials back to token.json for subsequent local runs
+            with open("token.json", "w") as token:
+                token.write(creds.to_json())
+            logging.info("Refreshed token saved to 'token.json'.")
+
+        return creds
+    except Exception as e:
+        logging.error(f"Failed to load or refresh token from 'token.json': {e}", exc_info=True)
+        return None
+
+
+def get_calendar_service() -> Resource:
+    """
+    Initializes and returns an authorized Google Calendar service instance.
+
+    This function orchestrates credential loading with the following priority:
+    1. In-memory cache (`_calendar_service`).
+    2. Google Secret Manager (for production environments).
+    3. Local `token.json` file (for local development).
+
+    Raises:
+        Exception: If no valid credentials can be found or created.
+    """
+    global _calendar_service
+    if _calendar_service:
+        return _calendar_service
+
+    creds = _load_credentials_from_secret_manager()
+
+    if not creds or not creds.valid:
+        logging.warning("Could not load valid credentials from Secret Manager. Falling back to local file.")
+        creds = _load_credentials_from_local_file()
+
+    if not creds or not creds.valid:
+        logging.critical("FATAL: No valid Google Calendar credentials found.")
+        raise Exception("Could not authenticate with Google Calendar. Please run the OAuth flow.")
+
+    try:
+        service = build("calendar", "v3", credentials=creds)
+        _calendar_service = service
+        logging.info("Google Calendar service initialized successfully.")
+        return service
+    except Exception as e:
+        logging.error(f"Failed to build Google Calendar service: {e}", exc_info=True)
+        raise
+
 
 @tool
 def find_available_slots(date_str: str) -> str:
@@ -100,32 +145,28 @@ def find_available_slots(date_str: str) -> str:
     logging.info(f"Tool 'find_available_slots' invoked for date: {date_str}")
     try:
         service = get_calendar_service()
+        tz = pytz.timezone(TIMEZONE)
 
-        # Parse the input date and set the time range for that day
+        # 1. Parse input and define search range for the day in the correct timezone
         try:
-            # Ensure date_str is just the date part if datetime is passed
-            if ' ' in date_str:
-                date_str = date_str.split(' ')[0]
-            search_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+            # Handle both 'YYYY-MM-DD' and 'YYYY-MM-DD HH:MM:SS' inputs gracefully
+            search_date = datetime.datetime.fromisoformat(date_str.split(' ')[0]).date()
         except ValueError:
             logging.error(f"Invalid date format received: '{date_str}'")
             return "Error: Invalid date format. Please ask the user for a date in 'YYYY-MM-DD' format."
 
-        tz = pytz.timezone(TIMEZONE)
-        # Define working hours (e.g., 9 AM to 5 PM)
         day_start = tz.localize(datetime.datetime.combine(search_date, datetime.time(9, 0)))
         day_end = tz.localize(datetime.datetime.combine(search_date, datetime.time(17, 0)))
         
-        # Ensure we don't search in the past
+        # 2. Get all busy slots from the calendar for that day
         now = datetime.datetime.now(tz)
-        if day_start < now:
-            day_start = now
+        time_min = max(day_start, now) # Don't search for slots in the past
 
-        logging.info(f"Searching for free slots on {date_str} between {day_start.isoformat()} and {day_end.isoformat()}.")
+        logging.info(f"Searching for free slots on {date_str} between {time_min.isoformat()} and {day_end.isoformat()}.")
 
         events_result = service.events().list(
             calendarId='primary',
-            timeMin=day_start.isoformat(),
+            timeMin=time_min.isoformat(),
             timeMax=day_end.isoformat(),
             singleEvents=True,
             orderBy='startTime'
@@ -133,44 +174,35 @@ def find_available_slots(date_str: str) -> str:
         busy_slots = events_result.get('items', [])
         logging.info(f"Found {len(busy_slots)} busy slots in the calendar for {date_str}.")
 
+        # 3. Generate all potential slots for the day
+        potential_slots = []
+        slot = time_min
+        # Align start time to the next 15 or 30-minute mark
+        if slot.minute not in [0, 15, 30, 45]:
+            slot += datetime.timedelta(minutes=15 - slot.minute % 15)
+
+        while slot < day_end:
+            potential_slots.append(slot)
+            slot += datetime.timedelta(minutes=APPOINTMENT_DURATION_MINUTES)
+
+        # 4. Filter out slots that overlap with busy periods
         available_slots = []
-        # Start checking from the beginning of the workday or now, whichever is later
-        potential_slot_time = day_start
-        # Align to the next 30-minute mark
-        if potential_slot_time.minute not in [0, 30]:
-             if potential_slot_time.minute > 30:
-                 potential_slot_time = potential_slot_time.replace(minute=30) + datetime.timedelta(minutes=30)
-             else:
-                 potential_slot_time = potential_slot_time.replace(minute=30)
-        
-        while potential_slot_time < day_end:
+        for potential_slot in potential_slots:
+            slot_end = potential_slot + datetime.timedelta(minutes=APPOINTMENT_DURATION_MINUTES)
             is_free = True
-            slot_end_time = potential_slot_time + datetime.timedelta(minutes=APPOINTMENT_DURATION_MINUTES)
-            
             for event in busy_slots:
                 event_start = datetime.datetime.fromisoformat(event['start'].get('dateTime')).astimezone(tz)
                 event_end = datetime.datetime.fromisoformat(event['end'].get('dateTime')).astimezone(tz)
                 
-                # Check for overlap
-                if max(potential_slot_time, event_start) < min(slot_end_time, event_end):
+                # Check for overlap: (StartA <= EndB) and (EndA >= StartB)
+                if potential_slot < event_end and slot_end > event_start:
                     is_free = False
-                    logging.debug(f"Slot at {potential_slot_time} conflicts with event '{event.get('summary')}' from {event_start} to {event_end}.")
-                    # Move potential start time to the end of the conflicting event
-                    potential_slot_time = event_end
-                    # Re-align to 30-min interval
-                    if potential_slot_time.minute not in [0, 30]:
-                        if potential_slot_time.minute > 30:
-                            potential_slot_time = potential_slot_time.replace(hour=potential_slot_time.hour + 1, minute=0)
-                        else:
-                            potential_slot_time = potential_slot_time.replace(minute=30)
-                    break 
+                    break
             
             if is_free:
-                # Add slot if it's within the working day
-                if potential_slot_time < day_end:
-                    available_slots.append(potential_slot_time.strftime('%H:%M'))
-                potential_slot_time += datetime.timedelta(minutes=APPOINTMENT_DURATION_MINUTES)
+                available_slots.append(potential_slot.strftime('%H:%M'))
 
+        # 5. Format and return the result
         if not available_slots:
             logging.warning(f"No available slots found for {date_str}.")
             return f"I'm sorry, but there are no available slots on {date_str}. Would you like to check another date?"
@@ -178,6 +210,7 @@ def find_available_slots(date_str: str) -> str:
         result_str = f"On {date_str}, the following times are available: {', '.join(available_slots)}."
         logging.info(f"Found available slots for {date_str}: {result_str}")
         return result_str
+        
     except Exception as e:
         logging.error(f"Error in find_available_slots: {e}", exc_info=True)
         return "Sorry, I encountered an error while trying to find available slots. Could you please try another date?"
@@ -209,7 +242,8 @@ def book_appointment(datetime_str: str, full_name: str, email: str, property_id:
 
     try:
         service = get_calendar_service()
-        start_time = datetime.datetime.strptime(datetime_str, "%Y-%m-%d %H:%M").astimezone(pytz.timezone(TIMEZONE))
+        tz = pytz.timezone(TIMEZONE)
+        start_time = tz.localize(datetime.datetime.strptime(datetime_str, "%Y-%m-%d %H:%M"))
         end_time = start_time + datetime.timedelta(minutes=APPOINTMENT_DURATION_MINUTES)
     except ValueError:
         logging.error(f"Invalid datetime format received: '{datetime_str}'")
@@ -217,29 +251,30 @@ def book_appointment(datetime_str: str, full_name: str, email: str, property_id:
 
     event = {
         'summary': f'Property Visit: {property_name} for {full_name}',
-        'description': f'Booked by AI Assistant "Sky".\nClient Email: {email}\nProperty ID: {property_id}',
+        'description': f'Booked by AI Assistant "Sky".\nClient Name: {full_name}\nClient Email: {email}\nProperty ID: {property_id}',
         'start': {'dateTime': start_time.isoformat(), 'timeZone': TIMEZONE},
         'end': {'dateTime': end_time.isoformat(), 'timeZone': TIMEZONE},
         'attendees': [{'email': email}],
         'reminders': {
             'useDefault': False,
             'overrides': [
-                {'method': 'email', 'minutes': 24 * 60},
-                {'method': 'popup', 'minutes': 60},
+                {'method': 'email', 'minutes': 24 * 60}, # 1 day before
+                {'method': 'popup', 'minutes': 60},      # 1 hour before
             ],
         },
+        'conferenceData': {
+            'createRequest': {
+                'requestId': f'visit-{property_id}-{email}-{start_time.timestamp()}',
+                'conferenceSolutionKey': {'type': 'hangoutsMeet'}
+            }
+        }
     }
 
     try:
-        created_event = service.events().insert(calendarId='primary', body=event, sendUpdates='all').execute()
-        logging.info(f"Successfully created event with ID: {created_event.get('id')}")
-        return f"Success! The appointment for {full_name} at {datetime_str} for the property at {property_name} has been booked. A calendar invite has been sent."
+        created_event = service.events().insert(calendarId='primary', body=event, sendUpdates='all', conferenceDataVersion=1).execute()
+        hangout_link = created_event.get('hangoutLink', 'Not available')
+        logging.info(f"Successfully created event with ID: {created_event.get('id')}. Meet link: {hangout_link}")
+        return f"Success! The appointment for {full_name} at {datetime_str} for the property at {property_name} has been booked. A calendar invite with a Google Meet link has been sent to {email}."
     except Exception as e:
         logging.error(f"Failed to create calendar event: {e}", exc_info=True)
         return "Sorry, I was unable to book the appointment. There was an error with the calendar service."
-
-# This allows the script to be run directly to generate the initial token.json
-if __name__ == '__main__':
-    logging.info("Running google_calendar.py directly to authenticate and generate token.json...")
-    get_calendar_service()
-    logging.info("Authentication successful. token.json should now be present.")
